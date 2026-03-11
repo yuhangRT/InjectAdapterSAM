@@ -1,0 +1,18 @@
+# SAM (Segment Anything Model) Dependencies
+# Install with: pip install -r requirements_sam.txt
+
+# Original CRNet dependencies
+torch>=1.2
+thop
+
+# SAM additional dependencies
+opencv-python>=4.1.0
+pycocotools>=2.0.0
+matplotlib>=3.2.0
+pillow>=8.0.0
+
+# For COCO dataset loading
+pycocotools>=2.0.0
+
+# Optional: for progress bars during training
+tqdm>=4.60.0
