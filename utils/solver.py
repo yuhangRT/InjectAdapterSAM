@@ -1,12 +1,13 @@
 import time
 import os
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from collections import namedtuple
 
 from utils import logger
 from utils.statics import AverageMeter, evaluator
-from utils.sam_metrics import SAMMetrics, compute_iou, compute_dice
+from utils.sam_metrics import SAMMetrics, compute_cldice
 
 __all__ = ['Trainer', 'Tester', 'SAMTrainer', 'SAMTester', 'SAMCriterion']
 
@@ -274,82 +275,108 @@ class Tester:
 
 class SAMCriterion(nn.Module):
     """
-    Combined loss for SAM+adapter training.
+    Combined loss for WireCR-SAM semantic segmentation.
 
-    Loss = mask_loss + iou_loss
-
-    Args:
-        mask_weight: Weight for mask loss
-        iou_weight: Weight for IoU prediction loss
-        dice_weight: Weight for Dice loss (optional)
+    The loss operates on two foreground channels (wire and hole), with
+    background handled implicitly during argmax decoding.
     """
 
-    def __init__(self, mask_weight=1.0, iou_weight=1.0, dice_weight=0.0):
+    def __init__(
+        self,
+        num_classes=3,
+        bce_weight=1.0,
+        dice_weight=1.0,
+        boundary_weight=0.0,
+        cldice_weight=0.0,
+        hole_class_weight=2.0,
+    ):
         super(SAMCriterion, self).__init__()
-        self.mask_weight = mask_weight
-        self.iou_weight = iou_weight
+        self.num_classes = num_classes
+        self.foreground_classes = num_classes - 1
+        self.bce_weight = bce_weight
         self.dice_weight = dice_weight
+        self.boundary_weight = boundary_weight
+        self.cldice_weight = cldice_weight
+        class_weights = torch.ones(self.foreground_classes)
+        if self.foreground_classes >= 2:
+            class_weights[1] = hole_class_weight
+        self.register_buffer("class_weights", class_weights)
+
+    def _foreground_targets(self, targets):
+        one_hot = F.one_hot(targets.long(), num_classes=self.num_classes).permute(0, 3, 1, 2).float()
+        return one_hot[:, 1:]
+
+    def _dice_loss(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        dims = (0, 2, 3)
+        intersection = (probs * targets).sum(dim=dims)
+        union = probs.sum(dim=dims) + targets.sum(dim=dims)
+        dice = (2 * intersection + 1e-6) / (union + 1e-6)
+        return 1 - dice.mean()
+
+    def _boundary_map(self, tensor):
+        dilated = F.max_pool2d(tensor, kernel_size=3, stride=1, padding=1)
+        eroded = -F.max_pool2d(-tensor, kernel_size=3, stride=1, padding=1)
+        return (dilated - eroded).clamp(min=0.0, max=1.0)
 
     def forward(self, predictions, targets):
-        """
-        Compute combined loss.
+        class_logits = predictions["class_logits"]
+        target_masks = targets["mask"].to(class_logits.device)
+        foreground_targets = self._foreground_targets(target_masks)
+        class_weights = self.class_weights.view(1, -1, 1, 1).to(class_logits.device)
 
-        Args:
-            predictions: Dict with 'masks' and 'iou_scores'
-            targets: Dict with 'masks' and 'iou_scores'
+        # Apply per-class positive weights manually to avoid BCE broadcasting
+        # mismatches on dense NCHW segmentation logits.
+        bce_map = F.binary_cross_entropy_with_logits(
+            class_logits,
+            foreground_targets,
+            reduction="none",
+        )
+        positive_weight_map = 1.0 + (class_weights - 1.0) * foreground_targets
+        bce_loss = (bce_map * positive_weight_map).mean()
+        dice_loss = self._dice_loss(class_logits, foreground_targets)
 
-        Returns:
-            Total loss
-        """
-        # Mask loss (binary cross-entropy with sigmoid)
-        pred_masks = predictions['masks']  # (B, K, H, W)
-        target_masks = targets['masks']  # (B, H, W)
+        probs = torch.sigmoid(class_logits)
+        boundary_loss = torch.tensor(0.0, device=class_logits.device)
+        if self.boundary_weight > 0:
+            pred_boundary = self._boundary_map(probs)
+            target_boundary = self._boundary_map(foreground_targets)
+            boundary_loss = F.l1_loss(pred_boundary, target_boundary)
 
-        # Expand target to match number of predicted masks
-        if pred_masks.dim() == 4:  # (B, K, H, W)
-            target_masks = target_masks.unsqueeze(1).expand_as(pred_masks)
+        cldice_loss = torch.tensor(0.0, device=class_logits.device)
+        if self.cldice_weight > 0 and self.foreground_classes > 0:
+            wire_probs = probs[:, :1]
+            wire_targets = foreground_targets[:, :1]
+            cldice_loss = 1 - compute_cldice(wire_probs, wire_targets).mean()
 
-        mask_loss = F.binary_cross_entropy_with_logits(pred_masks, target_masks)
-
-        # IoU prediction loss
-        if 'iou_scores' in predictions and 'iou_scores' in targets:
-            iou_loss = F.mse_loss(predictions['iou_scores'], targets['iou_scores'])
-        else:
-            iou_loss = torch.tensor(0.0, device=pred_masks.device)
-
-        # Optional Dice loss
-        dice_loss = torch.tensor(0.0, device=pred_masks.device)
-        if self.dice_weight > 0:
-            pred_sigmoid = torch.sigmoid(pred_masks)
-            target = target_masks.float()
-            intersection = (pred_sigmoid * target).sum(dim=(2, 3))
-            union = pred_sigmoid.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
-            dice = (2 * intersection) / (union + 1e-8)
-            dice_loss = 1 - dice.mean()
-
-        # Combine losses
         total_loss = (
-            self.mask_weight * mask_loss +
-            self.iou_weight * iou_loss +
-            self.dice_weight * dice_loss
+            self.bce_weight * bce_loss
+            + self.dice_weight * dice_loss
+            + self.boundary_weight * boundary_loss
+            + self.cldice_weight * cldice_loss
         )
 
-        return total_loss
+        return {
+            "loss": total_loss,
+            "bce_loss": bce_loss.detach(),
+            "dice_loss": dice_loss.detach(),
+            "boundary_loss": boundary_loss.detach(),
+            "cldice_loss": cldice_loss.detach(),
+        }
 
 
 class SAMTester:
-    """
-    Tester for SAM with CRNet adapter.
-
-    Evaluates segmentation quality using IoU, Dice, and other metrics.
-    """
+    """Tester for WireCR-SAM semantic segmentation."""
 
     def __init__(self, model, device, criterion=None, print_freq=20):
         self.model = model
         self.device = device
         self.criterion = criterion
         self.print_freq = print_freq
-        self.metrics = SAMMetrics()
+        self.metrics = SAMMetrics(
+            num_classes=getattr(model, "num_classes", 3),
+            class_names=getattr(model, "class_names", None),
+        )
 
     def __call__(self, data_loader, verbose=True):
         """
@@ -366,96 +393,75 @@ class SAMTester:
         self.metrics.reset()
 
         iter_time = AverageMeter('Iter time')
+        iter_loss = AverageMeter('Iter loss')
         time_tmp = time.time()
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(data_loader):
-                # Move to device
-                images = [item['image'].to(self.device) for item in batch]
-                gt_masks = [item['ground_truth_mask'].to(self.device) for item in batch]
-                original_sizes = [item['original_size'] for item in batch]
-                prompts = [item['prompt'] for item in batch]
+                images = batch["image"]
+                gt_masks = batch["mask"].to(self.device)
 
-                # Prepare batched input for SAM
-                batched_input = []
-                for img, orig_size, prompt in zip(images, original_sizes, prompts):
-                    input_dict = {
-                        'image': img.cpu(),  # SAM handles preprocessing
-                        'original_size': orig_size,
+                batched_input = [
+                    {
+                        "image": image,
+                        "original_size": tuple(image.shape[-2:]),
+                        "output_size": tuple(mask.shape[-2:]),
                     }
-                    # Add prompts
-                    if 'point_coords' in prompt:
-                        input_dict['point_coords'] = prompt['point_coords']
-                        input_dict['point_labels'] = prompt['point_labels']
-                    if 'boxes' in prompt:
-                        input_dict['boxes'] = prompt['boxes']
+                    for image, mask in zip(images, gt_masks)
+                ]
 
-                    batched_input.append(input_dict)
+                outputs = self.model(batched_input, multimask_output=False)
+                pred_masks = outputs["semantic_masks"]
 
-                # Forward pass
-                outputs = self.model(batched_input, multimask_output=True)
+                if self.criterion is not None:
+                    loss_dict = self.criterion(outputs, {"mask": gt_masks})
+                    iter_loss.update(loss_dict["loss"].item(), n=gt_masks.size(0))
 
-                # Process outputs and compute metrics
-                for output, gt_mask in zip(outputs, gt_masks):
-                    # Get best mask (highest IoU prediction)
-                    pred_masks = output['masks']  # (K, H, W)
-                    iou_preds = output['iou_predictions']  # (K,)
-
-                    # Select best mask
-                    best_idx = iou_preds.argmax()
-                    best_mask = pred_masks[best_idx]
-
-                    # Resize to ground truth size if needed
-                    if best_mask.shape != gt_mask.shape:
-                        best_mask = F.interpolate(
-                            best_mask.unsqueeze(0).unsqueeze(0),
-                            size=gt_mask.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze()
-
-                    # Convert to binary
-                    best_mask_binary = (torch.sigmoid(best_mask) > 0.5).float()
-
-                    # Update metrics
-                    self.metrics.update(
-                        best_mask_binary.unsqueeze(0),
-                        gt_mask.unsqueeze(0)
-                    )
+                self.metrics.update(pred_masks, gt_masks)
 
                 iter_time.update(time.time() - time_tmp)
                 time_tmp = time.time()
 
                 if verbose and (batch_idx + 1) % self.print_freq == 0:
                     current_metrics = self.metrics.compute()
-                    logger.info(f'[{batch_idx + 1}/{len(data_loader)}] '
-                               f'IoU: {current_metrics["iou"]:.4f} | '
-                               f'Dice: {current_metrics["dice"]:.4f} | '
-                               f'time: {iter_time.avg:.3f}')
+                    logger.info(
+                        f'[{batch_idx + 1}/{len(data_loader)}] '
+                        f'IoU: {current_metrics["iou"]:.4f} | '
+                        f'Dice: {current_metrics["dice"]:.4f} | '
+                        f'BoundaryF1: {current_metrics["boundary_f1"]:.4f} | '
+                        f'clDice: {current_metrics["cldice"]:.4f} | '
+                        f'time: {iter_time.avg:.3f}'
+                    )
 
         results = self.metrics.compute()
+        results["loss"] = iter_loss.avg if iter_loss.count > 0 else 0.0
 
         if verbose:
             logger.info(f'\n=> SAM Test Results:')
+            logger.info(f'  Loss: {results["loss"]:.4f}')
             logger.info(f'  IoU: {results["iou"]:.4f}')
             logger.info(f'  Dice: {results["dice"]:.4f}')
             logger.info(f'  Precision: {results["precision"]:.4f}')
             logger.info(f'  Recall: {results["recall"]:.4f}')
-            logger.info(f'  F1: {results["f1"]:.4f}\n')
+            logger.info(f'  F1: {results["f1"]:.4f}')
+            logger.info(f'  BoundaryF1: {results["boundary_f1"]:.4f}')
+            logger.info(f'  clDice: {results["cldice"]:.4f}')
+            if "wire_iou" in results:
+                logger.info(f'  Wire IoU: {results["wire_iou"]:.4f}')
+            if "hole_iou" in results:
+                logger.info(f'  Hole IoU: {results["hole_iou"]:.4f}')
+                logger.info(f'  Hole Recall: {results["hole_recall"]:.4f}')
+            if "foreground_iou" in results:
+                logger.info(f'  Foreground IoU: {results["foreground_iou"]:.4f}')
+            logger.info('')
 
         return results
 
 
 class SAMTrainer:
-    """
-    Trainer for SAM with CRNet adapter.
-
-    Handles training with multiple prompt strategies and tracks
-    both segmentation metrics and loss.
-    """
+    """Trainer for WireCR-SAM semantic segmentation."""
 
     def __init__(self, model, device, optimizer, criterion, scheduler,
-                 num_prompts=1, prompt_strategy='random',
                  save_path='./checkpoints', print_freq=20, val_freq=10, test_freq=10):
 
         self.model = model
@@ -463,10 +469,6 @@ class SAMTrainer:
         self.optimizer = optimizer
         self.criterion = criterion
         self.scheduler = scheduler
-
-        # Training configuration
-        self.num_prompts = num_prompts
-        self.prompt_strategy = prompt_strategy
 
         # Verbose arguments
         self.save_path = save_path
@@ -480,7 +482,7 @@ class SAMTrainer:
         self.best_iou = 0.0
 
         # Initialize tester
-        self.tester = SAMTester(model, device, print_freq=print_freq)
+        self.tester = SAMTester(model, device, criterion=criterion, print_freq=print_freq)
 
     def loop(self, epochs, train_loader, val_loader=None, test_loader=None):
         """
@@ -526,89 +528,39 @@ class SAMTrainer:
         time_tmp = time.time()
 
         for batch_idx, batch in enumerate(train_loader):
-            # Process each sample (SAM processes one at a time)
-            batch_loss = 0.0
-            batch_count = 0
+            gt_mask = batch["mask"].to(self.device)
+            batched_input = [
+                {
+                    "image": image,
+                    "original_size": tuple(image.shape[-2:]),
+                    "output_size": tuple(mask.shape[-2:]),
+                }
+                for image, mask in zip(batch["image"], gt_mask)
+            ]
 
-            for item in batch:
-                # Move to device
-                image = item['image'].to(self.device)
-                gt_mask = item['ground_truth_mask'].to(self.device)
-                original_size = item['original_size']
-                prompt = item['prompt']
+            outputs = self.model(batched_input, multimask_output=False)
+            loss_dict = self.criterion(outputs, {"mask": gt_mask})
+            loss = loss_dict["loss"]
 
-                # Prepare input
-                batched_input = [{
-                    'image': image.cpu(),
-                    'original_size': original_size,
-                }]
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+            self.scheduler.step()
 
-                # Add prompts
-                if 'point_coords' in prompt:
-                    batched_input[0]['point_coords'] = prompt['point_coords'].to(self.device)
-                    batched_input[0]['point_labels'] = prompt['point_labels'].to(self.device)
-                if 'boxes' in prompt:
-                    batched_input[0]['boxes'] = prompt['boxes'].to(self.device)
-
-                # Forward pass
-                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                    outputs = self.model(batched_input, multimask_output=True)
-
-                    # Prepare targets
-                    pred_masks = outputs[0]['masks']  # (K, H, W)
-                    pred_iou = outputs[0]['iou_predictions']  # (K,)
-
-                    # Resize to match
-                    if pred_masks.shape[-2:] != gt_mask.shape[-2:]:
-                        pred_masks = F.interpolate(
-                            pred_masks.unsqueeze(0),
-                            size=gt_mask.shape[-2:],
-                            mode='bilinear',
-                            align_corners=False
-                        ).squeeze(0)
-
-                    predictions = {
-                        'masks': pred_masks,
-                        'iou_scores': pred_iou,
-                    }
-
-                    # Compute IoU for target
-                    with torch.no_grad():
-                        best_iou = 0
-                        for k in range(pred_masks.shape[0]):
-                            pred_binary = (torch.sigmoid(pred_masks[k]) > 0.5).float()
-                            iou = compute_iou(pred_binary.unsqueeze(0), gt_mask.unsqueeze(0))
-                            best_iou = max(best_iou, iou.item())
-
-                    targets = {
-                        'masks': gt_mask,
-                        'iou_scores': torch.tensor([best_iou], device=self.device),
-                    }
-
-                    # Compute loss
-                    loss = self.criterion(predictions, targets)
-
-                # Backward pass
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-                self.scheduler.step()
-
-                batch_loss += loss.item()
-                batch_count += 1
-
-            # Update metrics
-            avg_loss = batch_loss / max(batch_count, 1)
-            iter_loss.update(avg_loss)
+            iter_loss.update(loss.item(), n=gt_mask.size(0))
             iter_time.update(time.time() - time_tmp)
             time_tmp = time.time()
 
             if (batch_idx + 1) % self.print_freq == 0:
-                logger.info(f'Epoch: [{self.cur_epoch}/{self.all_epoch}] '
-                           f'[{batch_idx + 1}/{len(train_loader)}] '
-                           f'lr: {self.scheduler.get_lr()[0]:.2e} | '
-                           f'loss: {iter_loss.avg:.3e} | '
-                           f'time: {iter_time.avg:.3f}')
+                logger.info(
+                    f'Epoch: [{self.cur_epoch}/{self.all_epoch}] '
+                    f'[{batch_idx + 1}/{len(train_loader)}] '
+                    f'lr: {self.scheduler.get_lr()[0]:.2e} | '
+                    f'loss: {iter_loss.avg:.3e} | '
+                    f'bce: {loss_dict["bce_loss"].item():.3e} | '
+                    f'dice: {loss_dict["dice_loss"].item():.3e} | '
+                    f'time: {iter_time.avg:.3f}'
+                )
 
         logger.info(f'=> Train Loss: {iter_loss.avg:.3e}\n')
         return iter_loss.avg
@@ -616,7 +568,10 @@ class SAMTrainer:
     def validate(self, val_loader):
         """Validate the model."""
         results = self.tester(val_loader, verbose=False)
-        logger.info(f'=> Val IoU: {results["iou"]:.4f} | Dice: {results["dice"]:.4f}\n')
+        logger.info(
+            f'=> Val IoU: {results["iou"]:.4f} | Dice: {results["dice"]:.4f} | '
+            f'BoundaryF1: {results["boundary_f1"]:.4f} | clDice: {results["cldice"]:.4f}\n'
+        )
         return results
 
     def _save_checkpoint(self, epoch, train_loss, val_results, test_results):
@@ -638,17 +593,21 @@ class SAMTrainer:
         if val_results is not None:
             state['val_iou'] = val_results['iou']
             state['val_dice'] = val_results['dice']
+            state['val_results'] = val_results
 
         if test_results is not None:
             state['test_iou'] = test_results['iou']
             state['test_dice'] = test_results['dice']
+            state['test_results'] = test_results
 
             # Save best model
             if test_results['iou'] > self.best_iou:
                 self.best_iou = test_results['iou']
+                state['best_iou'] = self.best_iou
                 torch.save(state, os.path.join(self.save_path, 'best_iou.pth'))
                 logger.info(f'=> Saved best model with IoU: {self.best_iou:.4f}')
 
+        state['best_iou'] = self.best_iou
         torch.save(state, os.path.join(self.save_path, 'last.pth'))
 
     def _print_progress(self, epoch, train_loss, val_results, test_results):

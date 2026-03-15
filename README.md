@@ -1,101 +1,294 @@
-## Overview
+# InjectAdapterSAM
 
-This is the PyTorch implementation of paper [Multi-resolution CSI Feedback with deep learning in Massive MIMO System](https://arxiv.org/abs/1910.14322).
+`InjectAdapterSAM` 将 CRNet 风格的多尺度卷积适配器接入 SAM（Segment Anything Model），形成当前仓库里的 `WireCR-SAM` 实验主线。
 
-## Requirements
+当前代码的定位已经固定为两类任务：
 
-To use this project, you need to ensure the following requirements are installed.
+- `wire_hole`：主任务，工业机床电路线束与接口孔洞三类语义分割
+- `coco`：辅任务，COCO 类别无关前景分割，仅用于辅助实验、迁移或烟测
 
-- Python >= 3.7
-- [PyTorch >= 1.2](https://pytorch.org/get-started/locally/)
-- [thop](https://github.com/Lyken17/pytorch-OpCounter)
+完整中文说明见 [使用说明.md](./使用说明.md)。旧版英文说明见 [README_SAM.md](./README_SAM.md)，但其中部分 COCO/prompt 内容已不是当前主接口。
 
-## Project Preparation
+## 当前特性
 
-#### A. Data Preparation
+- SAM `vit_b` / `vit_l` / `vit_h` 三种主干
+- `small` / `medium` / `large` 三种 WireCR 适配器
+- `4 / 8 / 16 / 32 / 64` 五种压缩比
+- 自动类感知 prompts，不再依赖旧版 `prompt-strategy` / `num-prompts`
+- 多类 BCE + Dice + Boundary + clDice 损失
+- `wire_hole` 主任务 + `coco` 辅助任务共用同一套训练入口
 
-The channel state information (CSI) matrix is generated from [COST2100](https://ieeexplore.ieee.org/document/6393523) model. Chao-Kai Wen and Shi Jin group provides a pre-processed version of COST2100 dataset in [Google Drive](https://drive.google.com/drive/folders/1_lAMLk_5k1Z8zJQlTr5NRnSD6ACaNRtj?usp=sharing), which is easier to use for the CSI feedback task; You can also download it from [Baidu Netdisk](https://pan.baidu.com/s/1Ggr6gnsXNwzD4ULbwqCmjA).
+## 安装
 
-You can generate your own dataset according to the [open source library of COST2100](https://github.com/cost2100/cost2100) as well. The details of data pre-processing can be found in our paper.
+```bash
+git clone git@github.com:yuhangRT/InjectAdapterSAM.git
+cd InjectAdapterSAM
+git submodule update --init --recursive
 
-#### B. Checkpoints Downloading
-
-The model checkpoints should be downloaded if you would like to reproduce our result. All the checkpoints files can be downloaded from [Baidu Netdisk](https://pan.baidu.com/s/1evKXkcF2Qp8Wn6cWJQiYQw) or [Google Drive](https://drive.google.com/drive/folders/16hQsrxkFuyjtmW4DOI8-Tix5TP5JfIia?usp=sharing)
-
-#### C. Project Tree Arrangement
-
-We recommend you to arrange the project tree as follows.
-
-```
-home
-├── CRNet  # The cloned CRNet repository
-│   ├── dataset
-│   ├── models
-│   ├── utils
-│   ├── main.py
-├── COST2100  # The data folder
-│   ├── DATA_Htestin.mat
-│   ├── ...
-├── Experiments
-│   ├── checkpoints  # The checkpoints folder
-│   │     ├── in_04.pth
-│   │     ├── ...
-│   ├── run.sh  # The bash script
-...
+pip install -r requirements_sam.txt
 ```
 
-## Train CRNet from Scratch
+下载 SAM 权重：
 
-An example of run.sh is listed below. Simply use it with `sh run.sh`. It will start advanced scheme aided CRNet training from scratch. Change scenario using `--scenario` and change compression ratio with `--cr`.
+```bash
+mkdir -p checkpoints
 
-``` bash
-python /home/CRNet/main.py \
-  --data-dir '/home/COST2100' \
-  --scenario 'in' \
-  --epochs 2500 \
-  --batch-size 200 \
+wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth -P checkpoints/
+# 或
+wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth -P checkpoints/
+# 或
+wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -P checkpoints/
+```
+
+## 数据集
+
+### 1. `wire_hole`（主任务）
+
+标签定义：
+
+- `0`: background
+- `1`: wire
+- `2`: interface-hole
+
+支持以下任一目录结构：
+
+```text
+<data-root>/
+├── images/
+│   ├── train/
+│   ├── val/
+│   └── test/
+└── masks/
+    ├── train/
+    ├── val/
+    └── test/
+```
+
+或：
+
+```text
+<data-root>/
+├── train/
+│   ├── images/
+│   └── masks/
+├── val/
+│   ├── images/
+│   └── masks/
+└── test/
+    ├── images/
+    └── masks/
+```
+
+`labels/` 也可以替代 `masks/`。
+
+### 2. `coco`（辅助任务）
+
+当前实现不是 COCO 多类实例分割，而是“把同一张图里的所有实例合并成前景”的二类语义分割：
+
+- `0`: background
+- `1`: foreground
+
+必须使用：
+
+```bash
+--dataset coco --num-classes 2
+```
+
+支持以下任一结构：
+
+```text
+<data-root>/
+├── train2017/
+├── val2017/
+└── annotations/
+    ├── instances_train2017.json
+    └── instances_val2017.json
+```
+
+或：
+
+```text
+<data-root>/
+├── images/
+│   ├── train2017/
+│   └── val2017/
+└── annotations/
+    ├── instances_train2017.json
+    └── instances_val2017.json
+```
+
+## 训练
+
+### `wire_hole` 主任务
+
+```bash
+python main_sam.py \
+  --mode sam \
+  --data-dir /path/to/wire_hole \
+  --dataset wire_hole \
+  --num-classes 3 \
+  --sam-model-type vit_b \
+  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
+  --batch-size 1 \
   --workers 0 \
-  --cr 4 \
-  --scheduler cosine \
-  --gpu 0 \
-  2>&1 | tee log.out
+  --epochs 100 \
+  --adapter-size small \
+  --compression-ratio 16 \
+  --class-aware-prompts \
+  --boundary-loss-weight 0.1 \
+  --cldice-weight 0.1 \
+  --hole-class-weight 2.0
 ```
 
-## Results and Reproduction
+### `coco` 辅助任务
 
-The main results reported in our paper are presented as follows. All the listed results can be found in Table1 of our paper. They are achieved from training CRNet with our advanced training scheme (cosine annealing scheduler with warm up for 2500 epochs).
+```bash
+python main_sam.py \
+  --mode sam \
+  --data-dir /path/to/coco \
+  --dataset coco \
+  --num-classes 2 \
+  --sam-model-type vit_b \
+  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
+  --batch-size 1 \
+  --workers 0 \
+  --epochs 10 \
+  --adapter-size small \
+  --compression-ratio 16 \
+  --class-aware-prompts \
+  --boundary-loss-weight 0.1 \
+  --cldice-weight 0.0
+```
 
+## 评估
 
-Scenario | Compression Ratio | NMSE | Flops | Checkpoints
-:--: | :--: | :--: | :--: | :--:
-indoor | 1/4 | -26.99 | 5.12M | in_04.pth
-indoor | 1/8 | -16.01 | 4.07M | in_08.pth
-indoor | 1/16 | -11.35 | 3.55M | in_16.pth
-indoor | 1/32 | -8.93 | 3.28M | in_32.pth
-indoor | 1/64 | -6.49 | 3.16M | in_64.pth
-outdoor | 1/4 | -12.70 | 5.12M | out_04.pth
-outdoor | 1/8 | -8.04 | 4.07M | out_08.pth
-outdoor | 1/16 | -5.44 | 3.55M | out_16.pth
-outdoor | 1/32 | -3.51 | 3.28M | out_32.pth
-outdoor | 1/64 | -2.22 | 3.16M | out_64.pth
-
-As aforementioned, we provide model checkpoints for all the results. Our code library supports easy inference. 
-
-**To reproduce all these results, simple add `--evaluate` to `run.sh` and pick the corresponding pre-trained model with `--pretrained`.** An example is shown as follows.
-
-``` bash
-python /home/CRNet/main.py \
-  --data-dir '/home/COST2100' \
-  --scenario 'in' \
-  --pretrained './checkpoints/in_04' \
+```bash
+python main_sam.py \
+  --mode sam \
   --evaluate \
-  --batch-size 200 \
+  --data-dir /path/to/wire_hole \
+  --dataset wire_hole \
+  --num-classes 3 \
+  --sam-model-type vit_b \
+  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
+  --pretrained ./checkpoints/wirecrsam_wire_hole_small_cr16/best_iou.pth \
+  --batch-size 1 \
   --workers 0 \
-  --cr 4 \
-  --cpu \
-  2>&1 | tee log.out
+  --adapter-size small \
+  --compression-ratio 16
 ```
 
-## Acknowledgment
+每次训练或评估结束后，程序会在对应运行目录下自动写出 `experiment_summary.json`。如需显式指定输出位置，可额外传入：
 
-Thank Chao-Kai Wen and Shi Jin group again for providing the pre-processed COST2100 dataset, you can find their related work named CsiNet in [Github-Python_CsiNet](https://github.com/sydney222/Python_CsiNet) 
+```bash
+--run-name your_run_name \
+--save-dir ./checkpoints \
+--results-json ./checkpoints/your_run_name/experiment_summary.json
+```
+
+## 论文实验脚本
+
+### 1. 运行表 4-2 到表 4-5 的实验套件
+
+下面的脚本会直接调用当前 `main_sam.py`，并为每个表生成一份 manifest：
+
+```bash
+python scripts/run_thesis_suite.py \
+  --table 4-2 \
+  --output-root ./thesis_runs \
+  --data-dir /path/to/wire_hole \
+  --dataset wire_hole \
+  --num-classes 3 \
+  --sam-model-type vit_b \
+  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
+  --batch-size 1 \
+  --workers 0 \
+  --epochs 100 \
+  --adapter-size medium \
+  --compression-ratio 8
+```
+
+支持：
+
+- `--table 4-2`：主对比实验
+- `--table 4-3`：结构消融
+- `--table 4-4`：损失消融
+- `--table 4-5`：少样本实验
+- `--table all`：依次运行全部套件
+
+只想先看将要执行的命令时，可加 `--dry-run`。
+
+### 2. 直接导出 CSV
+
+表 4-1 导出主实验训练配置：
+
+```bash
+python scripts/export_thesis_tables.py \
+  table4_1 \
+  --reference ./thesis_runs/table4_2/table4_2_wirecr_sam \
+  --output ./thesis_tables/table4_1.csv
+```
+
+表 4-2 导出主对比实验：
+
+```bash
+python scripts/export_thesis_tables.py \
+  table4_2 \
+  --manifest ./thesis_runs/table4_2/manifest_table4_2.json \
+  --output ./thesis_tables/table4_2.csv
+```
+
+表 4-3 导出结构消融：
+
+```bash
+python scripts/export_thesis_tables.py \
+  table4_3 \
+  --manifest ./thesis_runs/table4_3/manifest_table4_3.json \
+  --output ./thesis_tables/table4_3.csv
+```
+
+表 4-4 导出损失消融：
+
+```bash
+python scripts/export_thesis_tables.py \
+  table4_4 \
+  --manifest ./thesis_runs/table4_4/manifest_table4_4.json \
+  --output ./thesis_tables/table4_4.csv
+```
+
+表 4-5 导出少样本实验：
+
+```bash
+python scripts/export_thesis_tables.py \
+  table4_5 \
+  --manifest ./thesis_runs/table4_5/manifest_table4_5.json \
+  --output ./thesis_tables/table4_5.csv
+```
+
+## 关键参数
+
+| 参数 | 说明 |
+|------|------|
+| `--dataset` | `wire_hole` 或 `coco` |
+| `--num-classes` | `wire_hole=3`, `coco=2` |
+| `--sam-model-type` | `vit_b`, `vit_l`, `vit_h` |
+| `--adapter-size` | `small`, `medium`, `large` |
+| `--compression-ratio` | `4`, `8`, `16`, `32`, `64` |
+| `--class-aware-prompts` | 是否启用自动类感知 prompts |
+| `--freeze-encoder` | 是否冻结 SAM image encoder |
+| `--freeze-decoder` | 是否冻结 SAM mask decoder |
+| `--subset-ratio` | 训练集采样比例，支持少样本实验 |
+| `--boundary-loss-weight` | 边界损失权重 |
+| `--cldice-weight` | 细线结构 clDice 权重 |
+| `--hole-class-weight` | `wire_hole` 中 hole 类正样本权重 |
+| `--disable-adapter` | 关闭 WireCR adapter，作为无适配器对比基线 |
+| `--run-name` | 显式指定当前实验名 |
+| `--save-dir` | 指定实验输出根目录 |
+| `--results-json` | 指定结构化结果 JSON 输出路径 |
+
+## 说明
+
+- 论文主线请使用 `wire_hole`，`coco` 只建议作为辅助实验。
+- 当前推荐使用 `scripts/run_thesis_suite.py` 和 `scripts/export_thesis_tables.py` 组织论文实验。
+- `scripts/grid_search.sh` 和 `scripts/aggregate_results.py` 仍然是旧版 COCO/prompt 流程脚本，未同步到当前类感知 prompt 接口。
+- 如果你只是在 8GB 左右显存上验证可行性，优先使用 `vit_b + batch-size 1 + adapter-size small`。

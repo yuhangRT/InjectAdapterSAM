@@ -1,252 +1,185 @@
 """
-CRNet-based feature enhancement adapter for SAM.
+WireCR adapter modules for SAM feature enhancement.
 
-This module implements an adapter that processes SAM's ViT encoder output
-through a modified CRNet architecture to enhance features before passing
-them to SAM's mask decoder.
+This module redesigns CRNet's dual-path anisotropic convolutions into a
+parameter-efficient residual adapter that operates on SAM image embeddings.
 """
+
+from collections import OrderedDict
 
 import torch
 import torch.nn as nn
-from collections import OrderedDict
 
 from .crnet_blocks import ConvBN, CRBlockGeneric, MultiScaleEncoder
 
-__all__ = ['CRNetAdapter']
+__all__ = [
+    "ADAPTER_CONFIGS",
+    "WireCRAdapter",
+    "WireCRAdapterSimple",
+    "CRNetAdapter",
+    "CRNetAdapterSimple",
+    "crnet_adapter",
+]
 
 
-# Adapter size configurations
 ADAPTER_CONFIGS = {
-    'small': {
-        'encoder_channels': 32,
-        'decoder_channels': 64,
-        'crblock_channels': 64,
+    "small": {
+        "hidden_channels": 64,
+        "encoder_channels": 32,
+        "crblock_channels": 32,
     },
-    'medium': {
-        'encoder_channels': 64,
-        'decoder_channels': 128,
-        'crblock_channels': 128,
+    "medium": {
+        "hidden_channels": 128,
+        "encoder_channels": 64,
+        "crblock_channels": 64,
     },
-    'large': {
-        'encoder_channels': 128,
-        'decoder_channels': 256,
-        'crblock_channels': 256,
-    }
+    "large": {
+        "hidden_channels": 256,
+        "encoder_channels": 128,
+        "crblock_channels": 128,
+    },
 }
 
 
-class CRNetAdapter(nn.Module):
+class _AdapterBase(nn.Module):
+    """Common utilities for WireCR adapters."""
+
+    def _init_weights(self):
+        for module in self.modules():
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                nn.init.xavier_uniform_(module.weight)
+                if getattr(module, "bias", None) is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.BatchNorm2d):
+                nn.init.ones_(module.weight)
+                nn.init.zeros_(module.bias)
+
+
+class WireCRAdapter(_AdapterBase):
     """
-    CRNet-based feature enhancement adapter for SAM ViT encoder output.
+    Residual CRNet-inspired adapter for SAM embeddings.
 
-    This adapter processes SAM's ViT encoder features through an encoder-decoder
-    architecture with multi-scale convolutions and a compression bottleneck.
-    It maintains spatial resolution and uses a residual connection for stability.
-
-    Args:
-        in_channels: Number of input feature channels (256 for SAM ViT-H)
-        adapter_size: Size variant - 'small', 'medium', or 'large'
-        compression_ratio: Compression ratio reciprocal (4, 8, 16, 32, 64)
-        use_residual: Whether to use residual connection (default: True)
-
-    Input:
-        (batch, in_channels, H, W) - typically (N, 256, 64, 64) for SAM
-
-    Output:
-        (batch, in_channels, H, W) - same shape as input
-
-    Example:
-        >>> adapter = CRNetAdapter(in_channels=256, adapter_size='medium', compression_ratio=8)
-        >>> x = torch.randn(2, 256, 64, 64)
-        >>> y = adapter(x)
-        >>> assert y.shape == x.shape
+    The adapter keeps CRNet's dual-path multi-scale design while using a
+    stable compression-expansion bottleneck defined entirely in ``__init__``.
     """
 
-    def __init__(self, in_channels=256, adapter_size='medium',
-                 compression_ratio=4, use_residual=True):
-        super(CRNetAdapter, self).__init__()
+    def __init__(
+        self,
+        in_channels=256,
+        adapter_size="medium",
+        compression_ratio=8,
+        use_residual=True,
+    ):
+        super().__init__()
 
-        assert adapter_size in ADAPTER_CONFIGS, f"Invalid adapter_size: {adapter_size}"
-        assert compression_ratio in [4, 8, 16, 32, 64], f"Invalid compression_ratio: {compression_ratio}"
+        if adapter_size not in ADAPTER_CONFIGS:
+            raise ValueError(f"Invalid adapter_size: {adapter_size}")
+        if compression_ratio not in [4, 8, 16, 32, 64]:
+            raise ValueError(f"Invalid compression_ratio: {compression_ratio}")
+
+        config = ADAPTER_CONFIGS[adapter_size]
+        hidden_channels = config["hidden_channels"]
+        encoder_channels = config["encoder_channels"]
+        crblock_channels = config["crblock_channels"]
+        compressed_channels = max(hidden_channels // compression_ratio, 4)
 
         self.in_channels = in_channels
         self.adapter_size = adapter_size
         self.compression_ratio = compression_ratio
         self.use_residual = use_residual
 
-        # Get configuration for this adapter size
-        config = ADAPTER_CONFIGS[adapter_size]
-        encoder_channels = config['encoder_channels']
-        decoder_channels = config['decoder_channels']
-        crblock_channels = config['crblock_channels']
-
-        # Optional input projection if channels don't match encoder input
-        if in_channels != encoder_channels * 4:  # 4 = concat of two paths (2*2)
-            self.input_proj = ConvBN(in_channels, encoder_channels * 2, 1)
-        else:
-            self.input_proj = nn.Identity()
-
-        # Encoder: Multi-scale dual-path processing
+        self.input_proj = ConvBN(in_channels, hidden_channels, 1)
         self.encoder = MultiScaleEncoder(
-            in_channels=encoder_channels * 2,
-            out_channels=encoder_channels,
-            intermediate_channels=encoder_channels
+            in_channels=hidden_channels,
+            out_channels=hidden_channels,
+            intermediate_channels=encoder_channels,
         )
-
-        # Calculate FC dimensions
-        # We'll flatten spatial dims and apply FC compression
-        self.use_fc_compression = True
-
-        # Decoder: FC expansion -> 5x5 conv -> 2x CRBlock
-        self.decoder_fc = nn.Linear(
-            encoder_channels // compression_ratio,
-            encoder_channels
+        self.compression = nn.Sequential(
+            OrderedDict(
+                [
+                    ("compress", ConvBN(hidden_channels, compressed_channels, 1)),
+                    ("compress_relu", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+                    ("expand", ConvBN(compressed_channels, hidden_channels, 1)),
+                    ("expand_relu", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+                ]
+            )
         )
-
-        self.decoder_feature = nn.Sequential(OrderedDict([
-            ("conv5x5_bn", ConvBN(encoder_channels, encoder_channels, 5)),
-            ("relu", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
-            ("CRBlock1", CRBlockGeneric(encoder_channels, crblock_channels)),
-            ("CRBlock2", CRBlockGeneric(encoder_channels, crblock_channels))
-        ]))
-
-        # Optional output projection
-        if encoder_channels != in_channels:
-            self.output_proj = ConvBN(encoder_channels, in_channels, 1)
-        else:
-            self.output_proj = nn.Identity()
+        self.context_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        self.refine = nn.Sequential(
+            OrderedDict(
+                [
+                    ("conv5x5_bn", ConvBN(hidden_channels, hidden_channels, 5)),
+                    ("relu", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
+                    ("crblock1", CRBlockGeneric(hidden_channels, crblock_channels)),
+                    ("crblock2", CRBlockGeneric(hidden_channels, crblock_channels)),
+                ]
+            )
+        )
+        self.output_proj = ConvBN(hidden_channels, in_channels, 1)
+        self.output_scale = nn.Parameter(torch.tensor(1.0))
 
         self._init_weights()
 
-    def _init_weights(self):
-        """Initialize weights using Xavier uniform initialization."""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.xavier_uniform_(m.weight)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
     def forward(self, x):
-        """
-        Forward pass through CRNet adapter.
-
-        Args:
-            x: Input tensor of shape (batch, in_channels, H, W)
-
-        Returns:
-            Enhanced features of shape (batch, in_channels, H, W)
-        """
-        n, c, h, w = x.shape
-
-        # Store input for residual connection
         residual = x
 
-        # Optional input projection
         x = self.input_proj(x)
-
-        # Encoder: Multi-scale processing
         x = self.encoder(x)
+        x = self.compression(x)
+        x = x * (1.0 + self.context_gate(x))
+        x = self.refine(x)
+        x = self.output_proj(x) * self.output_scale
 
-        # FC compression (flatten spatial dims, compress, restore)
-        x = x.view(n, -1)  # (batch, encoder_channels * h * w)
-        x = x.mean(dim=1, keepdim=True)  # Global average pooling
-        x = x.repeat(1, h * w).view(n, h * w, -1)  # Expand back
-        # Simpler approach: just use 1x1 conv for compression
-        x = x.view(n, -1, h, w)
-
-        # Apply compression via 1x1 conv
-        compressed_channels = self.encoder.encoder.fusion.conv1x1.conv.out_channels
-        self.fc_compress = nn.Conv2d(compressed_channels, compressed_channels // self.compression_ratio, 1).to(x.device)
-        self.fc_expand = nn.Conv2d(compressed_channels // self.compression_ratio, compressed_channels, 1).to(x.device)
-
-        # Simpler architecture: just use decoder features
-        x = self.decoder_feature(x)
-
-        # Output projection
-        x = self.output_proj(x)
-
-        # Residual connection
         if self.use_residual:
             x = x + residual
 
         return x
 
 
-class CRNetAdapterSimple(nn.Module):
-    """
-    Simplified CRNet adapter without FC compression.
+class WireCRAdapterSimple(_AdapterBase):
+    """A simpler ablation variant without explicit compression-expansion."""
 
-    This version uses only the multi-scale encoder and CRBlock decoder
-    without the FC bottleneck, making it more suitable for maintaining
-    spatial information.
+    def __init__(self, in_channels=256, adapter_size="medium", use_residual=True):
+        super().__init__()
 
-    Args:
-        in_channels: Number of input feature channels
-        adapter_size: Size variant - 'small', 'medium', or 'large'
-        use_residual: Whether to use residual connection
-    """
+        if adapter_size not in ADAPTER_CONFIGS:
+            raise ValueError(f"Invalid adapter_size: {adapter_size}")
 
-    def __init__(self, in_channels=256, adapter_size='medium', use_residual=True):
-        super(CRNetAdapterSimple, self).__init__()
+        config = ADAPTER_CONFIGS[adapter_size]
+        hidden_channels = config["hidden_channels"]
+        encoder_channels = config["encoder_channels"]
+        crblock_channels = config["crblock_channels"]
 
-        assert adapter_size in ADAPTER_CONFIGS, f"Invalid adapter_size: {adapter_size}"
-
-        self.in_channels = in_channels
-        self.adapter_size = adapter_size
         self.use_residual = use_residual
 
-        config = ADAPTER_CONFIGS[adapter_size]
-        decoder_channels = config['decoder_channels']
-        crblock_channels = config['crblock_channels']
-
-        # Input projection
-        self.input_proj = ConvBN(in_channels, decoder_channels, 1)
-
-        # Multi-scale encoder
+        self.input_proj = ConvBN(in_channels, hidden_channels, 1)
         self.encoder = MultiScaleEncoder(
-            in_channels=decoder_channels,
-            out_channels=decoder_channels,
-            intermediate_channels=config['encoder_channels']
+            in_channels=hidden_channels,
+            out_channels=hidden_channels,
+            intermediate_channels=encoder_channels,
         )
-
-        # Decoder with CRBlocks
-        self.decoder = nn.Sequential(OrderedDict([
-            ("conv5x5_bn", ConvBN(decoder_channels, decoder_channels, 5)),
-            ("relu", nn.LeakyReLU(negative_slope=0.3, inplace=True)),
-            ("CRBlock1", CRBlockGeneric(decoder_channels, crblock_channels)),
-            ("CRBlock2", CRBlockGeneric(decoder_channels, crblock_channels))
-        ]))
-
-        # Output projection
-        self.output_proj = ConvBN(decoder_channels, in_channels, 1)
+        self.refine = nn.Sequential(
+            OrderedDict(
+                [
+                    ("crblock1", CRBlockGeneric(hidden_channels, crblock_channels)),
+                    ("crblock2", CRBlockGeneric(hidden_channels, crblock_channels)),
+                ]
+            )
+        )
+        self.output_proj = ConvBN(hidden_channels, in_channels, 1)
 
         self._init_weights()
 
-    def _init_weights(self):
-        """Initialize weights."""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv2d, nn.Linear)):
-                nn.init.xavier_uniform_(m.weight)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
     def forward(self, x):
-        """
-        Forward pass.
-
-        Args:
-            x: (batch, in_channels, H, W)
-
-        Returns:
-            (batch, in_channels, H, W)
-        """
         residual = x
 
         x = self.input_proj(x)
         x = self.encoder(x)
-        x = self.decoder(x)
+        x = self.refine(x)
         x = self.output_proj(x)
 
         if self.use_residual:
@@ -255,31 +188,28 @@ class CRNetAdapterSimple(nn.Module):
         return x
 
 
-def crnet_adapter(in_channels=256, adapter_size='medium',
-                  compression_ratio=4, use_residual=True, simple=False):
-    """
-    Factory function to create CRNet adapter.
+CRNetAdapter = WireCRAdapter
+CRNetAdapterSimple = WireCRAdapterSimple
 
-    Args:
-        in_channels: Input feature channels
-        adapter_size: 'small', 'medium', or 'large'
-        compression_ratio: Compression ratio (4, 8, 16, 32, 64)
-        use_residual: Use residual connection
-        simple: Use simplified version without FC compression
 
-    Returns:
-        CRNetAdapter or CRNetAdapterSimple instance
-    """
+def crnet_adapter(
+    in_channels=256,
+    adapter_size="medium",
+    compression_ratio=8,
+    use_residual=True,
+    simple=False,
+):
+    """Factory function for WireCR adapter variants."""
     if simple:
-        return CRNetAdapterSimple(
+        return WireCRAdapterSimple(
             in_channels=in_channels,
             adapter_size=adapter_size,
-            use_residual=use_residual
+            use_residual=use_residual,
         )
-    else:
-        return CRNetAdapter(
-            in_channels=in_channels,
-            adapter_size=adapter_size,
-            compression_ratio=compression_ratio,
-            use_residual=use_residual
-        )
+
+    return WireCRAdapter(
+        in_channels=in_channels,
+        adapter_size=adapter_size,
+        compression_ratio=compression_ratio,
+        use_residual=use_residual,
+    )

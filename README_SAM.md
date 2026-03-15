@@ -1,5 +1,8 @@
 # CRNet-SAM Adapter Integration
 
+> This file is a legacy overview from the earlier COCO/prompt-based prototype.
+> For the current codebase, use [README.md](./README.md) and [使用说明.md](./使用说明.md) as the authoritative documentation.
+
 ## Overview
 
 This project integrates CRNet as a feature enhancement adapter for the Segment Anything Model (SAM). The adapter processes SAM's ViT encoder output through a modified CRNet architecture to enhance features before passing them to SAM's mask decoder.

@@ -1,137 +1,171 @@
 """
-Main training script for SAM with CRNet adapter.
-
-This script trains and evaluates the Segment Anything Model (SAM) with
-a CRNet feature enhancement adapter.
+Main training script for WireCR-SAM.
 """
 
 import os
 import sys
+
 import torch
-import torch.nn as nn
 import torch.optim as optim
 
-# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from dataset.sam_dataset import get_dataset_class_names, get_sam_dataloader, validate_dataset_config
 from utils import logger
-from utils.parser import parser, args
+from utils.experiment_io import build_experiment_summary, resolve_run_dir, write_json
 from utils.init import init_device, init_sam_model
-from utils.solver import SAMTrainer, SAMTester, SAMCriterion
-from utils.scheduler import WarmUpCosineAnnealingLR, FakeLR
-from dataset.sam_dataset import get_sam_dataloader
+from utils.parser import args
+from utils.scheduler import FakeLR, WarmUpCosineAnnealingLR
+from utils.solver import SAMCriterion, SAMTester, SAMTrainer
+
+
+def _build_dataloader(split, subset_ratio=1.0):
+    return get_sam_dataloader(
+        data_root=args.data_dir,
+        split=split,
+        dataset_name=args.dataset,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        image_size=args.image_size,
+        subset_ratio=subset_ratio,
+        subset_seed=args.subset_seed,
+        num_classes=args.num_classes,
+    )
+
+
+def _validate_dataset_args():
+    validate_dataset_config(args.dataset, args.num_classes)
+
+
+def _log_results(title, results):
+    logger.info("\n" + "=" * 60)
+    logger.info(title)
+    logger.info("=" * 60)
+    logger.info(f'Loss: {results.get("loss", 0.0):.4f}')
+    logger.info(f'IoU: {results["iou"]:.4f}')
+    logger.info(f'Dice: {results["dice"]:.4f}')
+    logger.info(f'Precision: {results["precision"]:.4f}')
+    logger.info(f'Recall: {results["recall"]:.4f}')
+    logger.info(f'F1 Score: {results["f1"]:.4f}')
+    logger.info(f'Boundary F1: {results["boundary_f1"]:.4f}')
+    logger.info(f'clDice: {results["cldice"]:.4f}')
+    if "wire_iou" in results:
+        logger.info(f'Wire IoU: {results["wire_iou"]:.4f}')
+    if "hole_iou" in results:
+        logger.info(f'Hole IoU: {results["hole_iou"]:.4f}')
+        logger.info(f'Hole Recall: {results["hole_recall"]:.4f}')
+    if "foreground_iou" in results:
+        logger.info(f'Foreground IoU: {results["foreground_iou"]:.4f}')
+    logger.info("=" * 60 + "\n")
+
+
+def _collect_checkpoint_paths(run_dir, pretrained=None):
+    checkpoint_paths = {}
+    best_path = os.path.join(run_dir, "best_iou.pth")
+    last_path = os.path.join(run_dir, "last.pth")
+    if os.path.isfile(best_path):
+        checkpoint_paths["best_iou"] = os.path.abspath(best_path)
+    if os.path.isfile(last_path):
+        checkpoint_paths["last"] = os.path.abspath(last_path)
+    if pretrained is not None and os.path.isfile(pretrained):
+        checkpoint_paths["pretrained"] = os.path.abspath(pretrained)
+    return checkpoint_paths
+
+
+def _export_summary(*, run_dir, class_names, model, train_loader, val_loader, test_loader, results, best_iou, stage):
+    summary = build_experiment_summary(
+        args=args,
+        run_dir=run_dir,
+        class_names=class_names,
+        train_samples=len(train_loader.dataset),
+        val_samples=len(val_loader.dataset),
+        test_samples=len(test_loader.dataset),
+        model=model,
+        results=results,
+        best_iou=best_iou,
+        checkpoint_paths=_collect_checkpoint_paths(run_dir, pretrained=args.pretrained),
+        stage=stage,
+    )
+
+    summary_path = args.results_json or os.path.join(run_dir, "experiment_summary.json")
+    write_json(summary_path, summary)
+    logger.info(f"=> Structured summary saved to: {summary_path}")
 
 
 def main():
-    """Main training/evaluation function for SAM+CRNet adapter."""
+    logger.info("=" * 60)
+    logger.info("WireCR-SAM - Training")
+    logger.info("=" * 60)
 
-    logger.info('=' * 60)
-    logger.info('SAM with CRNet Adapter - Training')
-    logger.info('=' * 60)
-
-    # Override mode for SAM
-    args.mode = 'sam'
-
-    # Validate arguments
+    args.mode = "sam"
     if args.sam_checkpoint is None:
         logger.error("Error: --sam-checkpoint is required for SAM mode")
-        logger.info("\nPlease download SAM checkpoints from:")
-        logger.info("  ViT-H: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth")
-        logger.info("  ViT-L: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth")
-        logger.info("  ViT-B: https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth")
         sys.exit(1)
+    _validate_dataset_args()
 
-    # Initialize device
     device, pin_memory = init_device(args.seed, args.cpu, args.gpu, args.cpu_affinity)
+    class_names = get_dataset_class_names(args.dataset, args.num_classes)
+    run_dir = resolve_run_dir(args)
 
-    # Create data loaders
-    logger.info(f'=> Loading dataset: {args.dataset}')
-    logger.info(f'=> Data directory: {args.data_dir}')
+    logger.info(f"=> Loading dataset: {args.dataset}")
+    logger.info(f"=> Data directory: {args.data_dir}")
+    logger.info(f"=> Subset ratio: {args.subset_ratio}")
+    logger.info(f"=> Class names: {', '.join(class_names)}")
+    logger.info(f"=> Run directory: {run_dir}")
 
-    train_loader = get_sam_dataloader(
-        data_root=args.data_dir,
-        split='train',
-        dataset_name=args.dataset,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        prompt_strategy=args.prompt_strategy,
-        num_prompts=args.num_prompts,
-        image_size=1024,
-    )
+    train_loader = _build_dataloader("train", subset_ratio=args.subset_ratio)
+    val_loader = _build_dataloader("val")
 
-    val_loader = get_sam_dataloader(
-        data_root=args.data_dir,
-        split='val',
-        dataset_name=args.dataset,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        prompt_strategy=args.prompt_strategy,
-        num_prompts=args.num_prompts,
-        image_size=1024,
-    )
+    try:
+        test_loader = _build_dataloader("test")
+    except FileNotFoundError:
+        logger.warning("Test split not found, using validation split for testing.")
+        test_loader = val_loader
 
-    test_loader = get_sam_dataloader(
-        data_root=args.data_dir,
-        split='val',  # Use val as test for now
-        dataset_name=args.dataset,
-        batch_size=args.batch_size,
-        num_workers=args.workers,
-        prompt_strategy=args.prompt_strategy,
-        num_prompts=args.num_prompts,
-        image_size=1024,
-    )
+    logger.info(f"=> Train samples: {len(train_loader.dataset)}")
+    logger.info(f"=> Val samples: {len(val_loader.dataset)}")
+    logger.info(f"=> Test samples: {len(test_loader.dataset)}")
 
-    logger.info(f'=> Train samples: {len(train_loader.dataset)}')
-    logger.info(f'=> Val samples: {len(val_loader.dataset)}')
-    logger.info(f'=> Test samples: {len(test_loader.dataset)}')
-
-    # Initialize model
-    logger.info('\n=> Initializing model...')
+    logger.info("\n=> Initializing model...")
     model = init_sam_model(args)
     model.to(device)
-
-    # Print model info
     model.print_model_info()
 
-    # Define loss function
     criterion = SAMCriterion(
-        mask_weight=1.0,
-        iou_weight=1.0,
-        dice_weight=0.0,
+        num_classes=args.num_classes,
+        bce_weight=args.bce_weight,
+        dice_weight=args.dice_weight,
+        boundary_weight=args.boundary_loss_weight,
+        cldice_weight=args.cldice_weight,
+        hole_class_weight=args.hole_class_weight,
     ).to(device)
 
-    # Evaluation mode
     if args.evaluate:
-        logger.info('\n=> Running evaluation only...')
+        logger.info("\n=> Running evaluation only...")
         tester = SAMTester(model, device, criterion)
         results = tester(test_loader)
-        logger.info('\n' + '=' * 60)
-        logger.info('Evaluation Results')
-        logger.info('=' * 60)
-        logger.info(f'Mean IoU: {results["iou"]:.4f}')
-        logger.info(f'Mean Dice: {results["dice"]:.4f}')
-        logger.info(f'Precision: {results["precision"]:.4f}')
-        logger.info(f'Recall: {results["recall"]:.4f}')
-        logger.info(f'F1 Score: {results["f1"]:.4f}')
-        logger.info('=' * 60 + '\n')
+        _log_results("Evaluation Results", results)
+        _export_summary(
+            run_dir=run_dir,
+            class_names=class_names,
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            results=results,
+            best_iou=results.get("iou"),
+            stage="evaluate",
+        )
         return
 
-    # Define optimizer (only optimize trainable parameters)
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    logger.info(f'=> Trainable parameters: {sum(p.numel() for p in trainable_params):,}')
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    logger.info(f'=> Trainable parameters: {sum(param.numel() for param in trainable_params):,}')
 
-    optimizer = optim.Adam(
-        trainable_params,
-        lr=1e-4,
-        betas=(0.9, 0.999),
-        weight_decay=0.0,
-    )
+    optimizer = optim.Adam(trainable_params, lr=1e-4, betas=(0.9, 0.999), weight_decay=0.0)
+    total_steps = (args.epochs if args.epochs else 100) * len(train_loader)
+    warmup_steps = min(10 * len(train_loader), total_steps)
 
-    # Define learning rate scheduler
-    total_steps = args.epochs * len(train_loader) if args.epochs else 100 * len(train_loader)
-    warmup_steps = 10 * len(train_loader)
-
-    if args.scheduler == 'cosine':
+    if args.scheduler == "cosine":
         scheduler = WarmUpCosineAnnealingLR(
             optimizer=optimizer,
             T_max=total_steps,
@@ -141,9 +175,8 @@ def main():
     else:
         scheduler = FakeLR(optimizer=optimizer)
 
-    # Create trainer
-    save_path = os.path.join('./checkpoints',
-                            f'sam_{args.dataset}_{args.adapter_size}_cr{args.compression_ratio}')
+    subset_tag = "" if args.subset_ratio >= 1.0 else f"_subset{int(args.subset_ratio * 100):02d}"
+    save_path = run_dir
 
     trainer = SAMTrainer(
         model=model,
@@ -151,64 +184,61 @@ def main():
         optimizer=optimizer,
         criterion=criterion,
         scheduler=scheduler,
-        num_prompts=args.num_prompts,
-        prompt_strategy=args.prompt_strategy,
         save_path=save_path,
         print_freq=20,
-        val_freq=10,
-        test_freq=10,
+        val_freq=1,
+        test_freq=1,
     )
 
-    # Resume from checkpoint if specified
     if args.resume is not None:
         if os.path.isfile(args.resume):
-            logger.info(f'=> Resuming from checkpoint: {args.resume}')
+            logger.info(f"=> Resuming from checkpoint: {args.resume}")
             checkpoint = torch.load(args.resume, map_location=device)
-            model.load_state_dict(checkpoint['state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
-            trainer.cur_epoch = checkpoint['epoch'] + 1
-            trainer.best_iou = checkpoint.get('best_iou', 0.0)
+            model.load_state_dict(checkpoint["state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            trainer.cur_epoch = checkpoint["epoch"] + 1
+            trainer.best_iou = checkpoint.get("best_iou", 0.0)
             logger.info(f'=> Resumed from epoch {checkpoint["epoch"]}')
         else:
-            logger.warning(f'=> Checkpoint not found: {args.resume}')
+            logger.warning(f"=> Checkpoint not found: {args.resume}")
 
-    # Set number of epochs
     epochs = args.epochs if args.epochs else 100
+    logger.info("\n=> Training configuration:")
+    logger.info(f"  Epochs: {epochs}")
+    logger.info(f"  Batch size: {args.batch_size}")
+    logger.info("  Learning rate: 1e-4")
+    logger.info(f"  Scheduler: {args.scheduler}")
+    logger.info(f"  Adapter size: {args.adapter_size}")
+    logger.info(f"  Compression ratio: 1/{args.compression_ratio}")
+    logger.info(f"  Class-aware prompts: {args.class_aware_prompts}")
+    logger.info(f"  Freeze encoder: {args.freeze_encoder}")
+    logger.info(f"  Freeze decoder: {args.freeze_decoder}")
+    logger.info(f"  Boundary loss weight: {args.boundary_loss_weight}")
+    logger.info(f"  clDice weight: {args.cldice_weight}")
+    logger.info(f"  Hole class weight: {args.hole_class_weight}")
+    logger.info("")
 
-    logger.info(f'\n=> Training configuration:')
-    logger.info(f'  Epochs: {epochs}')
-    logger.info(f'  Batch size: {args.batch_size}')
-    logger.info(f'  Learning rate: 1e-4')
-    logger.info(f'  Scheduler: {args.scheduler}')
-    logger.info(f'  Adapter size: {args.adapter_size}')
-    logger.info(f'  Compression ratio: 1/{args.compression_ratio}')
-    logger.info(f'  Prompt strategy: {args.prompt_strategy}')
-    logger.info(f'  Num prompts: {args.num_prompts}')
-    logger.info(f'  Freeze encoder: {args.freeze_encoder}')
-    logger.info(f'  Freeze decoder: {args.freeze_decoder}')
-    logger.info('')
-
-    # Start training
-    logger.info('=> Starting training...\n')
+    logger.info("=> Starting training...\n")
     trainer.loop(epochs, train_loader, val_loader, test_loader)
 
-    # Final evaluation
-    logger.info('\n=> Running final evaluation...')
+    logger.info("\n=> Running final evaluation...")
     tester = SAMTester(model, device, criterion)
     results = tester(test_loader)
-
-    logger.info('\n' + '=' * 60)
-    logger.info('Final Test Results')
-    logger.info('=' * 60)
-    logger.info(f'Mean IoU: {results["iou"]:.4f}')
-    logger.info(f'Mean Dice: {results["dice"]:.4f}')
-    logger.info(f'Precision: {results["precision"]:.4f}')
-    logger.info(f'Recall: {results["recall"]:.4f}')
-    logger.info(f'F1 Score: {results["f1"]:.4f}')
+    _log_results("Final Test Results", results)
     logger.info(f'Best IoU achieved: {trainer.best_iou:.4f}')
-    logger.info('=' * 60 + '\n')
+    _export_summary(
+        run_dir=run_dir,
+        class_names=class_names,
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        results=results,
+        best_iou=trainer.best_iou,
+        stage="train",
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
