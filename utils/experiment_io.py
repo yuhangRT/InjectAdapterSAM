@@ -124,6 +124,8 @@ def build_experiment_summary(
         "workers": args.workers,
         "epochs": args.epochs,
         "scheduler": args.scheduler,
+        "val_freq": args.val_freq,
+        "test_freq": args.test_freq,
         "sam_model_type": args.sam_model_type,
         "sam_checkpoint": args.sam_checkpoint,
         "pretrained": args.pretrained,

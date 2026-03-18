@@ -52,8 +52,8 @@ def _log_results(title, results):
     if "wire_iou" in results:
         logger.info(f'Wire IoU: {results["wire_iou"]:.4f}')
     if "hole_iou" in results:
-        logger.info(f'Hole IoU: {results["hole_iou"]:.4f}')
-        logger.info(f'Hole Recall: {results["hole_recall"]:.4f}')
+        logger.info(f'Interface-hole IoU: {results["hole_iou"]:.4f}')
+        logger.info(f'Interface-hole Recall: {results["hole_recall"]:.4f}')
     if "foreground_iou" in results:
         logger.info(f'Foreground IoU: {results["foreground_iou"]:.4f}')
     logger.info("=" * 60 + "\n")
@@ -186,8 +186,8 @@ def main():
         scheduler=scheduler,
         save_path=save_path,
         print_freq=20,
-        val_freq=1,
-        test_freq=1,
+        val_freq=args.val_freq,
+        test_freq=args.test_freq,
     )
 
     if args.resume is not None:
@@ -209,6 +209,8 @@ def main():
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info("  Learning rate: 1e-4")
     logger.info(f"  Scheduler: {args.scheduler}")
+    logger.info(f"  Validation frequency: every {args.val_freq} epoch(s)")
+    logger.info(f"  Test frequency: every {args.test_freq} epoch(s)")
     logger.info(f"  Adapter size: {args.adapter_size}")
     logger.info(f"  Compression ratio: 1/{args.compression_ratio}")
     logger.info(f"  Class-aware prompts: {args.class_aware_prompts}")

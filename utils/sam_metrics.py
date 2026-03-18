@@ -125,7 +125,7 @@ class SAMMetrics:
             if num_classes == 2:
                 class_names = ["background", "foreground"]
             elif num_classes == 3:
-                class_names = ["background", "wire", "hole"]
+                class_names = ["background", "wire", "interface-hole"]
             else:
                 class_names = ["background"] + [f"class_{idx}" for idx in range(1, num_classes)]
         self.class_names = list(class_names[:num_classes])
@@ -201,9 +201,16 @@ class SAMMetrics:
         if "wire" in results["class_iou"]:
             results["wire_iou"] = results["class_iou"]["wire"]
             results["wire_dice"] = results["class_dice"]["wire"]
-        if "hole" in results["class_iou"]:
-            results["hole_iou"] = results["class_iou"]["hole"]
-            results["hole_recall"] = results["class_recall"]["hole"]
+        hole_key = None
+        for candidate in ("interface-hole", "hole"):
+            if candidate in results["class_iou"]:
+                hole_key = candidate
+                break
+        if hole_key is not None:
+            results["hole_iou"] = results["class_iou"][hole_key]
+            results["hole_recall"] = results["class_recall"][hole_key]
+            results["interface_hole_iou"] = results["class_iou"][hole_key]
+            results["interface_hole_recall"] = results["class_recall"][hole_key]
         if "foreground" in results["class_iou"]:
             results["foreground_iou"] = results["class_iou"]["foreground"]
             results["foreground_dice"] = results["class_dice"]["foreground"]

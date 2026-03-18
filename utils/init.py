@@ -2,16 +2,9 @@ import os
 import random
 
 import torch
-
-try:
-    import thop
-except ImportError:  # pragma: no cover - optional dependency for CSI profiling
-    thop = None
-
-from models import crnet
 from utils import logger, line_seg
 
-__all__ = ["init_device", "init_model", "init_sam_model"]
+__all__ = ["init_device", "init_sam_model"]
 
 
 def init_device(seed=None, cpu=None, gpu=None, affinity=None):
@@ -73,7 +66,11 @@ def init_sam_model(args):
 
     from models.sam_wrapper import SAMWithCRNetAdapter
 
-    class_names = ["background", "foreground"] if args.dataset == "coco" else ["background", "wire", "hole"]
+    class_names = (
+        ["background", "foreground"]
+        if args.dataset == "coco"
+        else ["background", "wire", "interface-hole"]
+    )
 
     model = SAMWithCRNetAdapter(
         sam_model=sam,
@@ -111,36 +108,6 @@ def init_sam_model(args):
     logger.info(f"=> Adapter Params: {adapter_params:,} ({100 * adapter_params / total_params:.2f}%)")
     logger.info(f"=> Frozen Params: {frozen_params:,} ({100 * frozen_params / total_params:.2f}%)")
     logger.info(f"=> Trainable Params: {trainable_params:,}")
-    logger.info(f"{line_seg}\n{model}\n{line_seg}\n")
-
-    return model
-
-
-def init_model(args):
-    """Initialize model based on selected mode."""
-    if args.mode == "sam":
-        return init_sam_model(args)
-
-    model = crnet(reduction=args.cr)
-
-    if args.pretrained is not None:
-        assert os.path.isfile(args.pretrained)
-        state_dict = torch.load(args.pretrained, map_location=torch.device("cpu"))["state_dict"]
-        model.load_state_dict(state_dict)
-        logger.info(f"pretrained model loaded from {args.pretrained}")
-
-    if thop is not None:
-        image = torch.randn([1, 2, 32, 32])
-        flops, params = thop.profile(model, inputs=(image,), verbose=False)
-        flops, params = thop.clever_format([flops, params], "%.3f")
-    else:
-        flops, params = "N/A", "N/A"
-        logger.warning("thop is not installed; skipping CSI FLOPs/params profiling.")
-
-    logger.info(f"=> Model Name: CRNet [pretrained: {args.pretrained}]")
-    logger.info(f"=> Model Config: compression ratio=1/{args.cr}")
-    logger.info(f"=> Model Flops: {flops}")
-    logger.info(f"=> Model Params Num: {params}\n")
     logger.info(f"{line_seg}\n{model}\n{line_seg}\n")
 
     return model

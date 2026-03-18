@@ -53,6 +53,10 @@ def write_csv(output_path, fieldnames, rows):
     print(f"[export] CSV saved to: {output_path}")
 
 
+def get_hole_metric(results, suffix):
+    return results.get(f"hole_{suffix}", results.get(f"interface_hole_{suffix}"))
+
+
 def export_table_4_1(args):
     summary = load_summary(args.reference)
     config = summary["config"]
@@ -99,8 +103,8 @@ def export_table_4_2(args):
                 "Boundary F1": results.get("boundary_f1"),
                 "clDice": results.get("cldice"),
                 "Wire IoU": results.get("wire_iou"),
-                "Hole IoU": results.get("hole_iou"),
-                "Hole Recall": results.get("hole_recall"),
+                "Hole IoU": get_hole_metric(results, "iou"),
+                "Hole Recall": get_hole_metric(results, "recall"),
             }
         )
     fieldnames = list(rows[0].keys()) if rows else []
@@ -124,7 +128,7 @@ def export_table_4_3(args):
                 "Dice": results.get("dice"),
                 "Boundary F1": results.get("boundary_f1"),
                 "clDice": results.get("cldice"),
-                "Hole Recall": results.get("hole_recall"),
+                "Hole Recall": get_hole_metric(results, "recall"),
             }
         )
     fieldnames = list(rows[0].keys()) if rows else []
@@ -149,8 +153,8 @@ def export_table_4_4(args):
                 "Dice metric": results.get("dice"),
                 "Boundary F1": results.get("boundary_f1"),
                 "clDice metric": results.get("cldice"),
-                "Hole IoU": results.get("hole_iou"),
-                "Hole Recall": results.get("hole_recall"),
+                "Hole IoU": get_hole_metric(results, "iou"),
+                "Hole Recall": get_hole_metric(results, "recall"),
             }
         )
     fieldnames = list(rows[0].keys()) if rows else []
@@ -171,8 +175,8 @@ def export_table_4_5(args):
                 "IoU": results.get("iou"),
                 "Dice": results.get("dice"),
                 "Wire IoU": results.get("wire_iou"),
-                "Hole IoU": results.get("hole_iou"),
-                "Hole Recall": results.get("hole_recall"),
+                "Hole IoU": get_hole_metric(results, "iou"),
+                "Hole Recall": get_hole_metric(results, "recall"),
                 "Boundary F1": results.get("boundary_f1"),
                 "clDice": results.get("cldice"),
             }

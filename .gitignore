@@ -43,3 +43,8 @@ data/*
 snapshots/
 checkpoints/
 *.pth
+dataset/
+samDataset/
+samDataset_wire_hole/
+inference_outputs/
+

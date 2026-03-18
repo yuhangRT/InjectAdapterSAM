@@ -1,0 +1,28 @@
+name: injectadaptersam
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # PyTorch official wheels support Python 3.10+; 3.10 is the safest choice
+  # here for SAM, pycocotools, and the legacy CSI path.
+  - python=3.10
+  - pip
+  - numpy
+  - scipy
+  - pillow
+  - matplotlib
+  - tqdm
+  # Needed when running `--dataset coco`.
+  - pycocotools
+  - pip:
+      # Use NVIDIA CUDA 13.0 wheels to match the local 580-series driver and RTX 4090.
+      - --index-url https://download.pytorch.org/whl/cu130
+      - --extra-index-url https://pypi.org/simple
+      - torch==2.9.1
+      - torchvision==0.24.1
+      # Used by the legacy CSI path for FLOPs/parameter profiling in utils/init.py.
+      - thop
+      # Not required by main_sam.py, but useful for SAM helper scripts without GUI deps.
+      - opencv-python-headless
+      # Make `import segment_anything` work directly inside the environment.
+      - -e ./third_party/sam

@@ -7,7 +7,7 @@
 - `wire_hole`：主任务，工业机床电路线束与接口孔洞三类语义分割
 - `coco`：辅任务，COCO 类别无关前景分割，仅用于辅助实验、迁移或烟测
 
-完整中文说明见 [使用说明.md](./使用说明.md)。旧版英文说明见 [README_SAM.md](./README_SAM.md)，但其中部分 COCO/prompt 内容已不是当前主接口。
+完整中文说明见 [使用说明.md](./使用说明.md)。
 
 ## 当前特性
 
@@ -80,6 +80,37 @@ wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -P che
 ```
 
 `labels/` 也可以替代 `masks/`。
+
+如果你的原始数据是当前仓库里的 `samDataset/` 这种平铺 ISAT 结构：
+
+```text
+samDataset/
+├── image_sam_002.jpg
+├── image_sam_002.json
+├── ...
+└── isat.yaml
+```
+
+请先离线转换成 `wire_hole` 目录，而不是直接把 JSON 喂给训练脚本：
+
+```bash
+python3 scripts/convert_isat_to_wire_hole.py \
+  --src ./samDataset \
+  --dst ./samDataset_wire_hole \
+  --seed 42
+```
+
+转换脚本会：
+
+- 按 `0=background, 1=wire, 2=interface-hole` 导出单通道 PNG mask
+- 自动生成 `images/train|val|test` 和 `masks/train|val|test`
+- 按 `int(0.8N)` / `int(0.9N)` 切点生成 `94/12/12` 的当前 split
+
+说明：
+
+- 不需要在 JSON 里单独标注 `background`
+- 背景来自未被 `wire` 或 `interface-hole` 多边形覆盖的像素
+- 若保留彩色 mask，固定颜色必须是黑=`background`、绿=`wire`、红=`interface-hole`
 
 ### 2. `coco`（辅助任务）
 

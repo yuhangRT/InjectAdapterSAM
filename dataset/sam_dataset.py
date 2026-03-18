@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - optional unless --dataset coco is used
 __all__ = [
     "WireHoleDataset",
     "CocoForegroundDataset",
+    "WIRE_HOLE_CLASS_NAMES",
     "get_dataset_class_names",
     "validate_dataset_config",
     "get_sam_dataloader",
@@ -41,11 +42,17 @@ COCO_ANNOTATIONS = {
     "val": ("annotations/instances_val2017.json",),
     "test": ("annotations/instances_test2017.json",),
 }
+WIRE_HOLE_CLASS_NAMES = ["background", "wire", "interface-hole"]
+WIRE_HOLE_RGB_PALETTE = {
+    (0, 0, 0): 0,
+    (0, 255, 0): 1,
+    (255, 0, 0): 2,
+}
 
 
 def get_dataset_class_names(dataset_name: str, num_classes: int) -> List[str]:
     if dataset_name == "wire_hole":
-        base_names = ["background", "wire", "hole"]
+        base_names = WIRE_HOLE_CLASS_NAMES
     elif dataset_name == "coco":
         base_names = ["background", "foreground"]
     else:
@@ -149,33 +156,42 @@ def _resize_image(image: Image.Image, image_size: int) -> torch.Tensor:
 
 def _remap_mask_values(mask_array: np.ndarray, num_classes: int) -> np.ndarray:
     if mask_array.ndim == 3:
-        flat = mask_array.reshape(-1, mask_array.shape[-1])
-        unique_values = np.unique(flat, axis=0)
-        if unique_values.shape[0] > num_classes:
+        if mask_array.shape[-1] == 1:
+            return _remap_mask_values(mask_array[..., 0], num_classes=num_classes)
+        if mask_array.shape[-1] != 3:
             raise ValueError(
-                f"Found {unique_values.shape[0]} unique mask colors, expected at most {num_classes}"
+                f"Unsupported mask channel count {mask_array.shape[-1]}. Expected 1 or 3 channels."
             )
-        mapping = {
-            tuple(value.tolist()): idx
-            for idx, value in enumerate(sorted(unique_values.tolist()))
+        if num_classes != 3:
+            raise ValueError(
+                "RGB mask palettes are only supported for the 3-class wire_hole dataset. "
+                f"Got num_classes={num_classes}."
+            )
+        flat = mask_array.reshape(-1, mask_array.shape[-1])
+        unique_values = {
+            tuple(int(channel) for channel in value.tolist())
+            for value in np.unique(flat, axis=0)
         }
+        unknown_values = sorted(unique_values.difference(WIRE_HOLE_RGB_PALETTE))
+        if unknown_values:
+            raise ValueError(
+                "Found unsupported wire_hole mask colors: "
+                f"{unknown_values}. Expected only {sorted(WIRE_HOLE_RGB_PALETTE)}."
+            )
         remapped = np.zeros(mask_array.shape[:2], dtype=np.int64)
-        for color, idx in mapping.items():
+        for color, idx in WIRE_HOLE_RGB_PALETTE.items():
             matches = np.all(mask_array == np.asarray(color, dtype=mask_array.dtype), axis=-1)
             remapped[matches] = idx
         return remapped
 
-    unique_values = sorted(np.unique(mask_array).tolist())
-    if len(unique_values) > num_classes:
-        raise ValueError(f"Found {len(unique_values)} mask labels, expected at most {num_classes}")
-    if unique_values == list(range(len(unique_values))):
-        return mask_array.astype(np.int64)
-
-    mapping = {value: idx for idx, value in enumerate(unique_values)}
-    remapped = np.zeros_like(mask_array, dtype=np.int64)
-    for value, idx in mapping.items():
-        remapped[mask_array == value] = idx
-    return remapped
+    unique_values = {int(value) for value in np.unique(mask_array).tolist()}
+    valid_values = set(range(num_classes))
+    invalid_values = sorted(unique_values.difference(valid_values))
+    if invalid_values:
+        raise ValueError(
+            f"Found unsupported mask labels {invalid_values}. Expected values within {sorted(valid_values)}."
+        )
+    return mask_array.astype(np.int64)
 
 
 def _resize_mask(mask: Image.Image, image_size: int, num_classes: int) -> torch.Tensor:
@@ -195,7 +211,7 @@ class WireHoleDataset(Dataset):
       2 -> interface-hole
     """
 
-    class_names = ["background", "wire", "hole"]
+    class_names = WIRE_HOLE_CLASS_NAMES
 
     def __init__(
         self,

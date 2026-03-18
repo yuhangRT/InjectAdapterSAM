@@ -13,7 +13,7 @@ def add_bool_arg(parser, name, default, help_text):
     parser.set_defaults(**{dest: default})
 
 
-parser = argparse.ArgumentParser(description="CRNet / WireCR-SAM Training")
+parser = argparse.ArgumentParser(description="WireCR-SAM Training")
 
 
 # ========================== Indispensable arguments ==========================
@@ -28,15 +28,10 @@ parser.add_argument("-j", "--workers", type=int, metavar="N", required=True, hel
 parser.add_argument(
     "--mode",
     type=str,
-    default="csi",
-    choices=["csi", "sam"],
-    help="Operation mode: csi for CSI feedback, sam for WireCR-SAM.",
+    default="sam",
+    choices=["sam"],
+    help="Retained for backward compatibility. Only SAM mode is supported.",
 )
-
-
-# ============================= CSI-specific arguments =============================
-
-parser.add_argument("--scenario", type=str, default=None, choices=["in", "out"], help="Channel scenario.")
 
 
 # ============================= SAM-specific arguments =============================
@@ -98,7 +93,12 @@ add_bool_arg(parser, "--freeze-prompt-encoder", True, "Freeze SAM prompt encoder
 
 parser.add_argument("--boundary-loss-weight", type=float, default=0.1, help="Weight for boundary-aware loss.")
 parser.add_argument("--cldice-weight", type=float, default=0.1, help="Weight for clDice loss on wire class.")
-parser.add_argument("--hole-class-weight", type=float, default=2.0, help="Positive class weight for hole masks.")
+parser.add_argument(
+    "--hole-class-weight",
+    type=float,
+    default=2.0,
+    help="Positive class weight for interface-hole masks.",
+)
 parser.add_argument("--dice-weight", type=float, default=1.0, help="Weight for Dice loss.")
 parser.add_argument("--bce-weight", type=float, default=1.0, help="Weight for BCE loss.")
 
@@ -116,7 +116,18 @@ parser.add_argument("--gpu", default=None, type=int, help="GPU id to use.")
 parser.add_argument("--cpu", action="store_true", help="Disable GPU training.")
 parser.add_argument("--cpu-affinity", default=None, type=str, help='CPU affinity, like "0xffff".')
 parser.add_argument("--epochs", type=int, metavar="N", help="Number of total epochs to run.")
-parser.add_argument("--cr", metavar="N", type=int, default=4, help="Compression ratio for CSI mode only.")
 parser.add_argument("--scheduler", type=str, default="const", choices=["const", "cosine"], help="Learning rate scheduler.")
+parser.add_argument(
+    "--val-freq",
+    type=int,
+    default=1,
+    help="Run validation every N epochs during training.",
+)
+parser.add_argument(
+    "--test-freq",
+    type=int,
+    default=1,
+    help="Run test evaluation every N epochs during training.",
+)
 
 args = parser.parse_args()

@@ -86,7 +86,7 @@ class SAMWithCRNetAdapter(nn.Module):
         if num_classes == 2:
             return ["background", "foreground"]
         if num_classes == 3:
-            return ["background", "wire", "hole"]
+            return ["background", "wire", "interface-hole"]
         return ["background"] + [f"class_{idx}" for idx in range(1, num_classes)]
 
     def _freeze_module(self, module):
