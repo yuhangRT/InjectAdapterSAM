@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from utils import logger
 from utils.sam_metrics import SAMMetrics, compute_cldice
 
-__all__ = ['SAMTrainer', 'SAMTester', 'SAMCriterion']
+__all__ = ['SAMTrainer', 'SAMTester', 'SAMCriterion', 'SAMFPNCriterion']
 
 class AverageMeter:
     """Tracks running averages for scalar metrics."""
@@ -121,6 +121,105 @@ class SAMCriterion(nn.Module):
         }
 
 
+class SAMFPNCriterion(nn.Module):
+    """Loss for the FPN semantic segmentation head."""
+
+    def __init__(
+        self,
+        num_classes=3,
+        class_weights=None,
+        hole_aux_weight=0.3,
+        boundary_weight=0.0,
+        cldice_weight=0.0,
+        hole_class_weight=2.0,
+    ):
+        super().__init__()
+        if num_classes != 3:
+            raise ValueError("SAMFPNCriterion currently supports exactly 3 classes.")
+        if class_weights is None:
+            class_weights = [1.0, 1.5, 4.0]
+        if len(class_weights) != num_classes:
+            raise ValueError(f"Expected {num_classes} class weights, got {len(class_weights)}.")
+
+        self.num_classes = num_classes
+        self.hole_aux_weight = hole_aux_weight
+        self.boundary_weight = boundary_weight
+        self.cldice_weight = cldice_weight
+        self.register_buffer("main_class_weights", torch.tensor(class_weights, dtype=torch.float32))
+        self.register_buffer("hole_pos_weight", torch.tensor(float(hole_class_weight), dtype=torch.float32))
+
+    @staticmethod
+    def _dice_from_probs(probs, targets, dims):
+        intersection = (probs * targets).sum(dim=dims)
+        denom = probs.sum(dim=dims) + targets.sum(dim=dims)
+        return (2 * intersection + 1e-6) / (denom + 1e-6)
+
+    def _foreground_dice_loss(self, logits, targets):
+        probs = torch.softmax(logits, dim=1)[:, 1:]
+        target_one_hot = F.one_hot(targets.long(), num_classes=self.num_classes).permute(0, 3, 1, 2).float()[:, 1:]
+        dice = self._dice_from_probs(probs, target_one_hot, dims=(0, 2, 3))
+        return 1 - dice.mean()
+
+    def _binary_dice_loss(self, logits, targets):
+        probs = torch.sigmoid(logits)
+        dice = self._dice_from_probs(probs, targets, dims=(0, 2, 3))
+        return 1 - dice.mean()
+
+    @staticmethod
+    def _boundary_map(tensor):
+        dilated = F.max_pool2d(tensor, kernel_size=3, stride=1, padding=1)
+        eroded = -F.max_pool2d(-tensor, kernel_size=3, stride=1, padding=1)
+        return (dilated - eroded).clamp(min=0.0, max=1.0)
+
+    def forward(self, predictions, targets):
+        main_logits = predictions["main_logits"]
+        hole_aux_logits = predictions["hole_aux_logits"]
+        target_masks = targets["mask"].to(main_logits.device)
+
+        main_ce_loss = F.cross_entropy(main_logits, target_masks.long(), weight=self.main_class_weights)
+        main_dice_loss = self._foreground_dice_loss(main_logits, target_masks)
+        main_probs = torch.softmax(main_logits, dim=1)
+
+        wire_probs = main_probs[:, 1:2]
+        wire_targets = (target_masks == 1).float().unsqueeze(1)
+        main_boundary_loss = torch.tensor(0.0, device=main_logits.device)
+        if self.boundary_weight > 0:
+            pred_boundary = self._boundary_map(wire_probs)
+            target_boundary = self._boundary_map(wire_targets)
+            main_boundary_loss = F.l1_loss(pred_boundary, target_boundary)
+
+        main_cldice_loss = torch.tensor(0.0, device=main_logits.device)
+        if self.cldice_weight > 0:
+            main_cldice_loss = 1 - compute_cldice(wire_probs, wire_targets).mean()
+
+        hole_target = (target_masks == 2).float().unsqueeze(1)
+        hole_bce_loss = F.binary_cross_entropy_with_logits(
+            hole_aux_logits,
+            hole_target,
+            pos_weight=self.hole_pos_weight.to(hole_aux_logits.device),
+        )
+        hole_dice_loss = self._binary_dice_loss(hole_aux_logits, hole_target)
+
+        loss_main = (
+            main_ce_loss
+            + 0.5 * main_dice_loss
+            + self.boundary_weight * main_boundary_loss
+            + self.cldice_weight * main_cldice_loss
+        )
+        loss_hole = hole_bce_loss + 0.5 * hole_dice_loss
+        total_loss = loss_main + self.hole_aux_weight * loss_hole
+
+        return {
+            "loss": total_loss,
+            "main_ce_loss": main_ce_loss.detach(),
+            "main_dice_loss": main_dice_loss.detach(),
+            "main_boundary_loss": main_boundary_loss.detach(),
+            "main_cldice_loss": main_cldice_loss.detach(),
+            "hole_bce_loss": hole_bce_loss.detach(),
+            "hole_dice_loss": hole_dice_loss.detach(),
+        }
+
+
 class SAMTester:
     """Tester for WireCR-SAM semantic segmentation."""
 
@@ -167,7 +266,7 @@ class SAMTester:
                 ]
 
                 outputs = self.model(batched_input, multimask_output=False)
-                pred_masks = outputs["semantic_masks"]
+                pred_masks = outputs.get("pred_masks", outputs.get("semantic_masks"))
 
                 if self.criterion is not None:
                     loss_dict = self.criterion(outputs, {"mask": gt_masks})
@@ -308,13 +407,24 @@ class SAMTrainer:
             time_tmp = time.time()
 
             if (batch_idx + 1) % self.print_freq == 0:
+                loss_terms = []
+                for key in (
+                    "bce_loss",
+                    "dice_loss",
+                    "main_ce_loss",
+                    "main_dice_loss",
+                    "hole_bce_loss",
+                    "hole_dice_loss",
+                ):
+                    if key in loss_dict:
+                        short_key = key.replace("_loss", "")
+                        loss_terms.append(f"{short_key}: {loss_dict[key].item():.3e}")
                 logger.info(
                     f'Epoch: [{self.cur_epoch}/{self.all_epoch}] '
                     f'[{batch_idx + 1}/{len(train_loader)}] '
                     f'lr: {self.scheduler.get_lr()[0]:.2e} | '
                     f'loss: {iter_loss.avg:.3e} | '
-                    f'bce: {loss_dict["bce_loss"].item():.3e} | '
-                    f'dice: {loss_dict["dice_loss"].item():.3e} | '
+                    f'{" | ".join(loss_terms)} | '
                     f'time: {iter_time.avg:.3f}'
                 )
 

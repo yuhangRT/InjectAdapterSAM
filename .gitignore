@@ -47,4 +47,6 @@ dataset/
 samDataset/
 samDataset_wire_hole/
 inference_outputs/
-
+samDataset_wire_hole_aug_strong/
+samDataset_*/
+inference*/

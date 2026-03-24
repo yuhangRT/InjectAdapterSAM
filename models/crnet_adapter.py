@@ -16,6 +16,7 @@ __all__ = [
     "ADAPTER_CONFIGS",
     "WireCRAdapter",
     "WireCRAdapterSimple",
+    "VanillaAdapter",
     "CRNetAdapter",
     "CRNetAdapterSimple",
     "crnet_adapter",
@@ -188,6 +189,61 @@ class WireCRAdapterSimple(_AdapterBase):
         return x
 
 
+class VanillaAdapter(_AdapterBase):
+    """A plain bottleneck convolutional adapter baseline without CR-style blocks."""
+
+    def __init__(
+        self,
+        in_channels=256,
+        adapter_size="medium",
+        compression_ratio=8,
+        use_residual=True,
+    ):
+        super().__init__()
+
+        if adapter_size not in ADAPTER_CONFIGS:
+            raise ValueError(f"Invalid adapter_size: {adapter_size}")
+        if compression_ratio not in [4, 8, 16, 32, 64]:
+            raise ValueError(f"Invalid compression_ratio: {compression_ratio}")
+
+        config = ADAPTER_CONFIGS[adapter_size]
+        hidden_channels = config["hidden_channels"]
+        compressed_channels = max(hidden_channels // compression_ratio, 4)
+
+        self.use_residual = use_residual
+
+        self.input_proj = ConvBN(in_channels, hidden_channels, 1)
+        self.body = nn.Sequential(
+            OrderedDict(
+                [
+                    ("relu1", nn.GELU()),
+                    ("compress", ConvBN(hidden_channels, compressed_channels, 1)),
+                    ("relu2", nn.GELU()),
+                    ("spatial", ConvBN(compressed_channels, compressed_channels, 3)),
+                    ("relu3", nn.GELU()),
+                    ("expand", ConvBN(compressed_channels, hidden_channels, 1)),
+                    ("relu4", nn.GELU()),
+                ]
+            )
+        )
+        self.output_proj = ConvBN(hidden_channels, in_channels, 1)
+        self.output_scale = nn.Parameter(torch.tensor(1.0))
+
+        self._init_weights()
+
+    def forward(self, x):
+        residual = x
+
+        x = self.input_proj(x)
+        x = self.body(x)
+        x = self.output_proj(x) * self.output_scale
+
+        if self.use_residual:
+            x = x + residual
+
+        return x
+
+
 CRNetAdapter = WireCRAdapter
 CRNetAdapterSimple = WireCRAdapterSimple
 
@@ -198,8 +254,21 @@ def crnet_adapter(
     compression_ratio=8,
     use_residual=True,
     simple=False,
+    adapter_kind="wirecr",
 ):
     """Factory function for WireCR adapter variants."""
+    adapter_kind = str(adapter_kind).strip().lower()
+    if adapter_kind not in {"wirecr", "vanilla"}:
+        raise ValueError(f"Invalid adapter_kind: {adapter_kind}")
+
+    if adapter_kind == "vanilla":
+        return VanillaAdapter(
+            in_channels=in_channels,
+            adapter_size=adapter_size,
+            compression_ratio=compression_ratio,
+            use_residual=use_residual,
+        )
+
     if simple:
         return WireCRAdapterSimple(
             in_channels=in_channels,

@@ -4,7 +4,7 @@ import random
 import torch
 from utils import logger, line_seg
 
-__all__ = ["init_device", "init_sam_model"]
+__all__ = ["init_device", "init_sam_model", "load_model_checkpoint"]
 
 
 def init_device(seed=None, cpu=None, gpu=None, affinity=None):
@@ -34,6 +34,18 @@ def init_device(seed=None, cpu=None, gpu=None, affinity=None):
     return device, pin_memory
 
 
+def load_model_checkpoint(model, checkpoint_path, *, strict=True):
+    checkpoint = torch.load(checkpoint_path, map_location=torch.device("cpu"))
+    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+    load_result = model.load_state_dict(state_dict, strict=strict)
+    if not strict:
+        logger.warning(
+            "Checkpoint loaded with strict=False. "
+            f"Missing keys: {len(load_result.missing_keys)} | Unexpected keys: {len(load_result.unexpected_keys)}"
+        )
+    return checkpoint
+
+
 def init_sam_model(args):
     """Initialize WireCR-SAM."""
     import sys
@@ -58,13 +70,16 @@ def init_sam_model(args):
     sam = sam_model_registry[args.sam_model_type](checkpoint=args.sam_checkpoint)
 
     adapter_config = {
+        "adapter_kind": args.adapter_kind,
         "adapter_size": args.adapter_size,
         "compression_ratio": args.compression_ratio,
         "use_residual": args.use_residual,
         "simple": args.adapter_simple,
+        "fpn_adapter_levels": getattr(args, "fpn_adapter_levels", "c4,c5"),
+        "fpn_adapter_size_map": getattr(args, "fpn_adapter_size_map", None),
+        "fpn_compression_map": getattr(args, "fpn_compression_map", None),
+        "fpn_simple_map": getattr(args, "fpn_simple_map", None),
     }
-
-    from models.sam_wrapper import SAMWithCRNetAdapter
 
     class_names = (
         ["background", "foreground"]
@@ -72,21 +87,34 @@ def init_sam_model(args):
         else ["background", "wire", "interface-hole"]
     )
 
-    model = SAMWithCRNetAdapter(
-        sam_model=sam,
-        adapter_config=adapter_config,
-        num_classes=args.num_classes,
-        class_names=class_names[:args.num_classes],
-        disable_adapter=args.disable_adapter,
-        class_aware_prompts=args.class_aware_prompts,
-        freeze_encoder=args.freeze_encoder,
-        freeze_decoder=args.freeze_decoder,
-        freeze_prompt_encoder=args.freeze_prompt_encoder,
-    )
+    if args.head_type == "prompt":
+        from models.sam_wrapper import SAMWithCRNetAdapter
+
+        model = SAMWithCRNetAdapter(
+            sam_model=sam,
+            adapter_config=adapter_config,
+            num_classes=args.num_classes,
+            class_names=class_names[:args.num_classes],
+            disable_adapter=args.disable_adapter,
+            class_aware_prompts=args.class_aware_prompts,
+            freeze_encoder=args.freeze_encoder,
+            freeze_decoder=args.freeze_decoder,
+            freeze_prompt_encoder=args.freeze_prompt_encoder,
+        )
+    else:
+        from models.sam_fpn_segmentor import SAMWithCRNetFPN
+
+        model = SAMWithCRNetFPN(
+            sam_model=sam,
+            adapter_config=adapter_config,
+            num_classes=args.num_classes,
+            class_names=class_names[:args.num_classes],
+            disable_adapter=args.disable_adapter,
+            freeze_encoder=args.freeze_encoder,
+        )
 
     if args.pretrained is not None and os.path.isfile(args.pretrained):
-        state_dict = torch.load(args.pretrained, map_location=torch.device("cpu"))
-        model.load_state_dict(state_dict["state_dict"] if "state_dict" in state_dict else state_dict)
+        load_model_checkpoint(model, args.pretrained, strict=True)
         logger.info(f"=> WireCR-SAM pretrained model loaded from {args.pretrained}")
 
     total_params = model.get_num_total_params()
@@ -94,12 +122,18 @@ def init_sam_model(args):
     frozen_params = model.get_num_frozen_params()
     trainable_params = total_params - frozen_params
 
-    adapter_variant = "none" if args.disable_adapter else ("simple" if args.adapter_simple else "full")
+    if args.disable_adapter:
+        adapter_variant = "none"
+    elif args.adapter_kind == "vanilla":
+        adapter_variant = "vanilla"
+    else:
+        adapter_variant = "simple" if args.adapter_simple else "full"
 
     logger.info("=> Model Name: WireCR-SAM")
+    logger.info(f"=> Head Type: {args.head_type}")
     logger.info(f"=> SAM Type: {args.sam_model_type}")
     logger.info(
-        f"=> Adapter Config: variant={adapter_variant}, size={args.adapter_size}, "
+        f"=> Adapter Config: kind={args.adapter_kind}, variant={adapter_variant}, size={args.adapter_size}, "
         f"compression=1/{args.compression_ratio}, class_prompts={args.class_aware_prompts}"
     )
     logger.info(f"=> Semantic Classes: {args.num_classes}")

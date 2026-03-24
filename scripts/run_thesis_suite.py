@@ -35,12 +35,20 @@ def build_passthrough_parser():
     parser.add_argument("--dataset", type=str, default="wire_hole")
     parser.add_argument("--num-classes", type=int, default=3)
     parser.add_argument("--sam-model-type", type=str, default="vit_h")
+    parser.add_argument("--head-type", type=str, default="prompt", choices=["prompt", "fpn"])
+    parser.add_argument("--train-augment", type=str, default="industrial", choices=["none", "industrial"])
+    parser.add_argument("--augment-strength", type=str, default="medium", choices=["light", "medium", "strong"])
     parser.add_argument("--adapter-size", type=str, default="medium", choices=["small", "medium", "large"])
+    parser.add_argument("--adapter-kind", type=str, default="wirecr", choices=["wirecr", "vanilla"])
     parser.add_argument("--compression-ratio", type=int, default=8, choices=[4, 8, 16, 32, 64])
     parser.add_argument("--subset-ratio", type=float, default=1.0)
     parser.add_argument("--boundary-loss-weight", type=float, default=0.1)
     parser.add_argument("--cldice-weight", type=float, default=0.1)
     parser.add_argument("--hole-class-weight", type=float, default=2.0)
+    parser.add_argument("--fpn-adapter-levels", type=str, default="c4,c5")
+    parser.add_argument("--fpn-adapter-size-map", type=str, default=None)
+    parser.add_argument("--fpn-compression-map", type=str, default=None)
+    parser.add_argument("--fpn-simple-map", type=str, default=None)
     add_bool_arg(parser, "--use-residual", True, "Use residual connection in the WireCR adapter.")
     add_bool_arg(parser, "--adapter-simple", False, "Use a simplified adapter without compression-expansion.")
     add_bool_arg(parser, "--disable-adapter", False, "Disable the WireCR adapter.")
@@ -54,6 +62,8 @@ def build_passthrough_parser():
 def cli_tokens_from_overrides(overrides):
     tokens = []
     for key, value in overrides.items():
+        if value is None:
+            continue
         flag = f"--{key.replace('_', '-')}"
         if isinstance(value, bool):
             tokens.append(flag if value else f"--no-{key.replace('_', '-')}")
@@ -62,16 +72,88 @@ def cli_tokens_from_overrides(overrides):
     return tokens
 
 
+def _supports_prompt_controls(base):
+    return getattr(base, "head_type", "prompt") == "prompt"
+
+
+def _fpn_layer_ablation_specs(base):
+    if getattr(base, "head_type", "prompt") != "fpn":
+        return []
+
+    specs = [
+        {
+            "row_id": "levels_c5",
+            "row_label": "Adapter Levels = c5",
+            "description": "Keep adapter only on the deepest FPN level.",
+            "overrides": {
+                "fpn_adapter_levels": "c5",
+                "fpn_adapter_size_map": None,
+                "fpn_compression_map": None,
+                "fpn_simple_map": None,
+            },
+        },
+        {
+            "row_id": "levels_c3_c4_c5",
+            "row_label": "Adapter Levels = c3,c4,c5",
+            "description": "Add a lightweight low-level adapter on c3 while keeping c4/c5 unchanged.",
+            "overrides": {
+                "fpn_adapter_levels": "c3,c4,c5",
+                "fpn_adapter_size_map": None,
+                "fpn_compression_map": None,
+                "fpn_simple_map": None,
+            },
+        },
+        {
+            "row_id": "levels_c2_c3_c4_c5",
+            "row_label": "Adapter Levels = c2,c3,c4,c5",
+            "description": "Enable lightweight low-level adapters on both c2 and c3 in addition to c4/c5.",
+            "overrides": {
+                "fpn_adapter_levels": "c2,c3,c4,c5",
+                "fpn_adapter_size_map": None,
+                "fpn_compression_map": None,
+                "fpn_simple_map": None,
+            },
+        },
+    ]
+    base_levels = str(getattr(base, "fpn_adapter_levels", "c4,c5")).replace(" ", "").lower()
+    if base_levels != "c4,c5":
+        specs.insert(
+            1,
+            {
+                "row_id": "levels_c4_c5",
+                "row_label": "Adapter Levels = c4,c5",
+                "description": "Baseline FPN injection over the two deepest levels.",
+                "overrides": {
+                    "fpn_adapter_levels": "c4,c5",
+                    "fpn_adapter_size_map": None,
+                    "fpn_compression_map": None,
+                    "fpn_simple_map": None,
+                },
+            },
+        )
+    return specs
+
+
 def table_4_2_specs(base):
-    return [
+    specs = [
         {
             "row_id": "original_sam_transfer",
             "row_label": "Original SAM Transfer",
             "description": "Disable the WireCR adapter but keep the automatic semantic decoding pipeline.",
             "overrides": {
                 "disable_adapter": True,
+                "adapter_kind": "wirecr",
                 "adapter_simple": False,
-                "class_aware_prompts": True,
+            },
+        },
+        {
+            "row_id": "vanilla_adapter",
+            "row_label": "Vanilla Adapter",
+            "description": "Use a plain bottleneck convolutional adapter baseline instead of WireCR.",
+            "overrides": {
+                "disable_adapter": False,
+                "adapter_kind": "vanilla",
+                "adapter_simple": False,
             },
         },
         {
@@ -80,8 +162,8 @@ def table_4_2_specs(base):
             "description": "Use the simplified adapter without compression-expansion bottleneck.",
             "overrides": {
                 "disable_adapter": False,
+                "adapter_kind": "wirecr",
                 "adapter_simple": True,
-                "class_aware_prompts": True,
             },
         },
         {
@@ -90,18 +172,29 @@ def table_4_2_specs(base):
             "description": "Full model with WireCR adapter and class-aware prompts.",
             "overrides": {
                 "disable_adapter": False,
+                "adapter_kind": "wirecr",
                 "adapter_simple": False,
-                "class_aware_prompts": True,
             },
         },
     ]
+    if _supports_prompt_controls(base):
+        for spec in specs:
+            spec["overrides"]["class_aware_prompts"] = True
+    return specs
 
 
 def table_4_3_specs(base):
     specs = [
         {
             "row_id": "reference",
-            "row_label": f"Reference ({base.adapter_size}, 1/{base.compression_ratio})",
+            "row_label": (
+                f"Reference ({base.adapter_kind}, {base.adapter_size}, 1/{base.compression_ratio})"
+                if getattr(base, "head_type", "prompt") != "fpn"
+                else (
+                    f"Reference ({base.adapter_kind}, {base.adapter_size}, 1/{base.compression_ratio}, "
+                    f"levels={base.fpn_adapter_levels})"
+                )
+            ),
             "description": "Reference structure used by the main model.",
             "overrides": {},
         }
@@ -115,7 +208,7 @@ def table_4_3_specs(base):
                 "row_id": f"size_{size}",
                 "row_label": f"Adapter Size = {size}",
                 "description": "Structure ablation over adapter width.",
-                "overrides": {"adapter_size": size},
+                "overrides": {"adapter_kind": "wirecr", "adapter_size": size},
             }
         )
 
@@ -127,26 +220,39 @@ def table_4_3_specs(base):
                 "row_id": f"cr_{ratio}",
                 "row_label": f"Compression = 1/{ratio}",
                 "description": "Structure ablation over bottleneck compression ratio.",
-                "overrides": {"compression_ratio": ratio},
+                "overrides": {"adapter_kind": "wirecr", "compression_ratio": ratio},
             }
         )
 
     specs.extend(
         [
             {
+                "row_id": "adapter_vanilla",
+                "row_label": "Adapter Kind = Vanilla",
+                "description": "Replace the WireCR adapter with a plain bottleneck baseline.",
+                "overrides": {
+                    "adapter_kind": "vanilla",
+                    "adapter_simple": False,
+                },
+            },
+            {
                 "row_id": "adapter_simple",
                 "row_label": "Simple Adapter = On",
                 "description": "Remove compression-expansion bottleneck.",
-                "overrides": {"adapter_simple": True},
+                "overrides": {"adapter_kind": "wirecr", "adapter_simple": True},
             },
+        ]
+    )
+    if _supports_prompt_controls(base):
+        specs.append(
             {
                 "row_id": "class_prompts_off",
                 "row_label": "Class-aware Prompts = Off",
                 "description": "Disable prompt offsets and keep only learnable class embeddings.",
                 "overrides": {"class_aware_prompts": False},
-            },
-        ]
-    )
+            }
+        )
+    specs.extend(_fpn_layer_ablation_specs(base))
     return specs
 
 

@@ -56,6 +56,7 @@ class SAMWithCRNetAdapter(nn.Module):
         else:
             self.adapter = crnet_adapter(
                 in_channels=self.encoder_out_channels,
+                adapter_kind=adapter_config.get("adapter_kind", "wirecr"),
                 adapter_size=adapter_config.get("adapter_size", "medium"),
                 compression_ratio=adapter_config.get("compression_ratio", 8),
                 use_residual=adapter_config.get("use_residual", True),
@@ -167,6 +168,7 @@ class SAMWithCRNetAdapter(nn.Module):
             "low_res_class_logits": low_res_logits,
             "semantic_logits": semantic_logits,
             "semantic_masks": semantic_logits.argmax(dim=1),
+            "pred_masks": semantic_logits.argmax(dim=1),
             "iou_predictions": iou_predictions,
         }
 
@@ -196,6 +198,7 @@ class SAMWithCRNetAdapter(nn.Module):
         print("WireCR-SAM Model Info")
         print(f"{'=' * 60}")
         print(f"Adapter enabled: {not self.disable_adapter}")
+        print(f"Adapter kind: {self.adapter_config.get('adapter_kind', 'wirecr')}")
         print(f"Adapter size: {self.adapter_config.get('adapter_size', 'medium')}")
         print(f"Compression ratio: 1/{self.adapter_config.get('compression_ratio', 8)}")
         print(f"Use residual: {self.adapter_config.get('use_residual', True)}")
@@ -211,6 +214,7 @@ class SAMWithCRNetAdapter(nn.Module):
 
 def create_sam_with_adapter(
     sam_model,
+    adapter_kind="wirecr",
     adapter_size="medium",
     compression_ratio=8,
     use_residual=True,
@@ -223,6 +227,7 @@ def create_sam_with_adapter(
 ):
     """Factory function for WireCR-SAM."""
     adapter_config = {
+        "adapter_kind": adapter_kind,
         "adapter_size": adapter_size,
         "compression_ratio": compression_ratio,
         "use_residual": use_residual,

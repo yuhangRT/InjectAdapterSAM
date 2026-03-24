@@ -22,11 +22,12 @@ if str(REPO_ROOT) not in sys.path:
 
 
 WIRE_HOLE_CLASS_NAMES = ["background", "wire", "interface-hole"]
-WIRE_HOLE_PALETTE = [
-    0, 0, 0,
-    0, 255, 0,
-    255, 0, 0,
-] + [0, 0, 0] * 253
+WIRE_HOLE_COLORS = {
+    0: (0, 0, 0),
+    1: (0, 255, 0),
+    2: (255, 0, 0),
+}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
 def add_bool_arg(parser, name, default, help_text):
@@ -42,16 +43,28 @@ def add_bool_arg(parser, name, default, help_text):
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Single-image inference for WireCR-SAM.")
-    parser.add_argument("--image", required=True, help="Path to the input image.")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--image", help="Path to a single input image.")
+    input_group.add_argument("--image-dir", help="Path to a directory of input images. Images are discovered recursively.")
     parser.add_argument("--pretrained", required=True, help="Path to WireCR-SAM checkpoint (best_iou.pth or last.pth).")
     parser.add_argument("--sam-checkpoint", default=None, help="Path to SAM pretrained checkpoint.")
     parser.add_argument("--summary-json", default=None, help="Optional experiment_summary.json used to infer model config.")
-    parser.add_argument("--output-dir", default="./inference_outputs", help="Directory used to save inference results.")
+    parser.add_argument(
+        "--output-dir",
+        default="./inference",
+        help="Root directory used to save inference results. Outputs are written under <output-dir>/<checkpoint-parent>/.",
+    )
     parser.add_argument("--image-size", type=int, default=None, help="Inference resize size. Defaults to training config or 1024.")
     parser.add_argument("--sam-model-type", choices=["vit_b", "vit_l", "vit_h"], default=None)
+    parser.add_argument("--head-type", choices=["prompt", "fpn"], default=None)
     parser.add_argument("--num-classes", type=int, default=None)
     parser.add_argument("--adapter-size", choices=["small", "medium", "large"], default=None)
+    parser.add_argument("--adapter-kind", choices=["wirecr", "vanilla"], default=None)
     parser.add_argument("--compression-ratio", type=int, choices=[4, 8, 16, 32, 64], default=None)
+    parser.add_argument("--fpn-adapter-levels", default=None)
+    parser.add_argument("--fpn-adapter-size-map", default=None)
+    parser.add_argument("--fpn-compression-map", default=None)
+    parser.add_argument("--fpn-simple-map", default=None)
     parser.add_argument("--gpu", type=int, default=None, help="GPU id to use.")
     parser.add_argument("--cpu", action="store_true", help="Force CPU inference.")
     add_bool_arg(parser, "--use-residual", True, "Use residual connection in the WireCR adapter.")
@@ -105,11 +118,17 @@ def resolve_config(args):
 
     config = {
         "sam_model_type": choose("sam_model_type"),
+        "head_type": choose("head_type", "prompt"),
         "sam_checkpoint": choose("sam_checkpoint"),
         "num_classes": int(choose("num_classes", 3)),
         "image_size": int(choose("image_size", 1024)),
         "adapter_size": choose("adapter_size", "medium"),
+        "adapter_kind": choose("adapter_kind", "wirecr"),
         "compression_ratio": int(choose("compression_ratio", 8)),
+        "fpn_adapter_levels": choose("fpn_adapter_levels", "c4,c5"),
+        "fpn_adapter_size_map": choose("fpn_adapter_size_map"),
+        "fpn_compression_map": choose("fpn_compression_map"),
+        "fpn_simple_map": choose("fpn_simple_map"),
         "use_residual": choose("use_residual", True),
         "adapter_simple": choose("adapter_simple", False),
         "disable_adapter": choose("disable_adapter", False),
@@ -141,29 +160,47 @@ def load_model(config, checkpoint_path, device):
         sys.path.insert(0, str(sam_repo))
 
     from segment_anything import sam_model_registry
-    from models.sam_wrapper import SAMWithCRNetAdapter
+    from utils.init import load_model_checkpoint
 
     sam = sam_model_registry[config["sam_model_type"]](checkpoint=config["sam_checkpoint"])
-    model = SAMWithCRNetAdapter(
-        sam_model=sam,
-        adapter_config={
-            "adapter_size": config["adapter_size"],
-            "compression_ratio": config["compression_ratio"],
-            "use_residual": config["use_residual"],
-            "simple": config["adapter_simple"],
-        },
-        num_classes=config["num_classes"],
-        class_names=WIRE_HOLE_CLASS_NAMES[: config["num_classes"]],
-        disable_adapter=config["disable_adapter"],
-        class_aware_prompts=config["class_aware_prompts"],
-        freeze_encoder=True,
-        freeze_decoder=False,
-        freeze_prompt_encoder=True,
-    )
+    adapter_config = {
+        "adapter_size": config["adapter_size"],
+        "adapter_kind": config["adapter_kind"],
+        "compression_ratio": config["compression_ratio"],
+        "fpn_adapter_levels": config["fpn_adapter_levels"],
+        "fpn_adapter_size_map": config["fpn_adapter_size_map"],
+        "fpn_compression_map": config["fpn_compression_map"],
+        "fpn_simple_map": config["fpn_simple_map"],
+        "use_residual": config["use_residual"],
+        "simple": config["adapter_simple"],
+    }
+    if config["head_type"] == "fpn":
+        from models.sam_fpn_segmentor import SAMWithCRNetFPN
 
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
-    state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
-    model.load_state_dict(state_dict)
+        model = SAMWithCRNetFPN(
+            sam_model=sam,
+            adapter_config=adapter_config,
+            num_classes=config["num_classes"],
+            class_names=WIRE_HOLE_CLASS_NAMES[: config["num_classes"]],
+            disable_adapter=config["disable_adapter"],
+            freeze_encoder=True,
+        )
+    else:
+        from models.sam_wrapper import SAMWithCRNetAdapter
+
+        model = SAMWithCRNetAdapter(
+            sam_model=sam,
+            adapter_config=adapter_config,
+            num_classes=config["num_classes"],
+            class_names=WIRE_HOLE_CLASS_NAMES[: config["num_classes"]],
+            disable_adapter=config["disable_adapter"],
+            class_aware_prompts=config["class_aware_prompts"],
+            freeze_encoder=True,
+            freeze_decoder=False,
+            freeze_prompt_encoder=True,
+        )
+
+    load_model_checkpoint(model, checkpoint_path, strict=True)
     model.to(device)
     model.eval()
     return model
@@ -190,20 +227,21 @@ def infer_mask(model, image_tensor, output_size):
             ],
             multimask_output=False,
         )
-    return outputs["semantic_masks"][0].detach().cpu().numpy().astype(np.uint8)
+    return outputs["pred_masks"][0].detach().cpu().numpy().astype(np.uint8)
 
 
-def build_palette_mask(mask_array):
-    mask = Image.fromarray(mask_array, mode="P")
-    mask.putpalette(WIRE_HOLE_PALETTE)
-    return mask
+def build_color_mask(mask_array):
+    color_mask = np.zeros((*mask_array.shape, 3), dtype=np.uint8)
+    for class_idx, color in WIRE_HOLE_COLORS.items():
+        color_mask[mask_array == class_idx] = np.asarray(color, dtype=np.uint8)
+    return Image.fromarray(color_mask, mode="RGB")
 
 
 def build_overlay(base_image, mask_array, alpha):
     overlay = np.asarray(base_image.convert("RGB"), dtype=np.float32)
     color_mask = np.zeros_like(overlay)
-    color_mask[mask_array == 1] = np.array([0, 255, 0], dtype=np.float32)
-    color_mask[mask_array == 2] = np.array([255, 0, 0], dtype=np.float32)
+    color_mask[mask_array == 1] = np.array(WIRE_HOLE_COLORS[1], dtype=np.float32)
+    color_mask[mask_array == 2] = np.array(WIRE_HOLE_COLORS[2], dtype=np.float32)
 
     foreground = mask_array > 0
     blended = overlay.copy()
@@ -220,35 +258,46 @@ def summarize_mask(mask_array):
     return summary
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
+def list_image_paths(image_path: str | None, image_dir: str | None) -> list[Path]:
+    if image_path is not None:
+        resolved = Path(image_path).resolve()
+        if not resolved.is_file():
+            raise FileNotFoundError(f"Input image not found: {resolved}")
+        return [resolved]
 
-    image_path = Path(args.image).resolve()
-    checkpoint_path = Path(args.pretrained).resolve()
-    output_dir = Path(args.output_dir).resolve()
+    root = Path(image_dir).resolve()
+    if not root.is_dir():
+        raise FileNotFoundError(f"Input image directory not found: {root}")
 
-    if not image_path.is_file():
-        raise FileNotFoundError(f"Input image not found: {image_path}")
-    if not checkpoint_path.is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    image_paths = sorted(
+        path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    )
+    if not image_paths:
+        raise FileNotFoundError(f"No supported images found under: {root}")
+    return image_paths
 
-    config = resolve_config(args)
-    device = build_device(args)
-    model = load_model(config, str(checkpoint_path), device)
 
+def resolve_output_root(output_dir: str, checkpoint_path: Path) -> Path:
+    return Path(output_dir).resolve() / checkpoint_path.parent.name
+
+
+def resolve_output_paths(image_path: Path, input_root: Path | None, output_root: Path) -> tuple[Path, Path]:
+    if input_root is not None:
+        relative_parent = image_path.relative_to(input_root).parent
+        base_dir = output_root / relative_parent
+    else:
+        base_dir = output_root
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return base_dir / f"{image_path.stem}_pred_mask.png", base_dir / f"{image_path.stem}_overlay.png"
+
+
+def run_inference_on_image(model, config, device, image_path: Path, mask_path: Path, overlay_path: Path, args) -> None:
     base_image, image_tensor, original_size = prepare_image(image_path, config["image_size"])
     pred_mask = infer_mask(model, image_tensor, original_size)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = image_path.stem
-
-    mask_path = output_dir / f"{stem}_pred_mask.png"
-    overlay_path = output_dir / f"{stem}_overlay.png"
-
     if args.save_mask:
-        palette_mask = build_palette_mask(pred_mask)
-        palette_mask.save(mask_path)
+        color_mask = build_color_mask(pred_mask)
+        color_mask.save(mask_path)
         print(f"[save] mask: {mask_path}")
 
     if args.save_overlay:
@@ -258,13 +307,44 @@ def main():
 
     print(f"[info] device: {device}")
     print(f"[info] image: {image_path}")
-    print(f"[info] checkpoint: {checkpoint_path}")
+    print(f"[info] checkpoint: {Path(args.pretrained).resolve()}")
     print(f"[info] sam_model_type: {config['sam_model_type']}")
-    print(f"[info] adapter: {'disabled' if config['disable_adapter'] else ('simple' if config['adapter_simple'] else 'full')}")
+    if config["disable_adapter"]:
+        adapter_label = "disabled"
+    elif config["adapter_kind"] == "vanilla":
+        adapter_label = "vanilla"
+    else:
+        adapter_label = "simple" if config["adapter_simple"] else "full"
+    print(f"[info] adapter: {adapter_label}")
     print(f"[info] image_size: {config['image_size']}")
 
     for value, class_name, count in summarize_mask(pred_mask):
         print(f"[mask] label={value} class={class_name} pixels={count}")
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    checkpoint_path = Path(args.pretrained).resolve()
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    image_paths = list_image_paths(args.image, args.image_dir)
+    input_root = Path(args.image_dir).resolve() if args.image_dir is not None else None
+    output_root = resolve_output_root(args.output_dir, checkpoint_path)
+
+    config = resolve_config(args)
+    device = build_device(args)
+    model = load_model(config, str(checkpoint_path), device)
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    print(f"[info] output_root: {output_root}")
+    print(f"[info] total_images: {len(image_paths)}")
+
+    for image_path in image_paths:
+        mask_path, overlay_path = resolve_output_paths(image_path, input_root, output_root)
+        run_inference_on_image(model, config, device, image_path, mask_path, overlay_path, args)
 
 
 if __name__ == "__main__":

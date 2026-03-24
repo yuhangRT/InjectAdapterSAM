@@ -64,6 +64,7 @@ def export_table_4_1(args):
     row = {
         "sam_model_type": config["sam_model_type"],
         "adapter_variant": model["adapter_variant"],
+        "adapter_kind": config.get("adapter_kind", "wirecr"),
         "adapter_size": config["adapter_size"],
         "compression_ratio": config["compression_ratio"],
         "freeze_encoder": int(bool(config["freeze_encoder"])),
@@ -120,10 +121,12 @@ def export_table_4_3(args):
         rows.append(
             {
                 "Experiment": item["row_label"],
+                "adapter kind": config.get("adapter_kind", "wirecr"),
                 "adapter size": config["adapter_size"],
                 "compression ratio": config["compression_ratio"],
                 "adapter simple": int(bool(config["adapter_simple"])),
                 "class-aware prompts": int(bool(config["class_aware_prompts"])),
+                "fpn adapter levels": config.get("fpn_adapter_levels", "c4,c5"),
                 "IoU": results.get("iou"),
                 "Dice": results.get("dice"),
                 "Boundary F1": results.get("boundary_f1"),

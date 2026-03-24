@@ -8,6 +8,7 @@ from datetime import datetime
 __all__ = [
     "build_run_name",
     "resolve_run_dir",
+    "resolve_results_json_path",
     "write_json",
     "build_experiment_summary",
 ]
@@ -26,13 +27,20 @@ def build_run_name(args):
     if getattr(args, "run_name", None):
         return _sanitize_tag(args.run_name)
 
-    adapter_variant = "noadapter" if args.disable_adapter else ("simple" if args.adapter_simple else "full")
+    if args.disable_adapter:
+        adapter_variant = "noadapter"
+    elif getattr(args, "adapter_kind", "wirecr") == "vanilla":
+        adapter_variant = "vanilla"
+    else:
+        adapter_variant = "simple" if args.adapter_simple else "full"
     parts = [
         "wirecrsam",
         _sanitize_tag(args.dataset),
         _sanitize_tag(args.sam_model_type),
+        _sanitize_tag(args.head_type) if getattr(args, "head_type", "prompt") != "prompt" else None,
         adapter_variant,
     ]
+    parts = [part for part in parts if part is not None]
 
     if not args.disable_adapter:
         parts.extend(
@@ -49,6 +57,11 @@ def build_run_name(args):
         ]
     )
 
+    if getattr(args, "train_augment", "industrial") != "industrial":
+        parts.append(f"aug{_sanitize_tag(args.train_augment)}")
+    else:
+        parts.append(f"augind-{_sanitize_tag(getattr(args, 'augment_strength', 'medium'))}")
+
     if not args.freeze_encoder:
         parts.append("fe0")
     if args.freeze_decoder:
@@ -63,6 +76,15 @@ def build_run_name(args):
         parts.append(f"cw{_format_float_tag(args.cldice_weight)}")
     if float(args.hole_class_weight) != 2.0:
         parts.append(f"hw{_format_float_tag(args.hole_class_weight)}")
+    if getattr(args, "head_type", "prompt") == "fpn":
+        normalized_levels = _sanitize_tag(getattr(args, "fpn_adapter_levels", "c4,c5")).replace("-", "")
+        if normalized_levels and normalized_levels != "c4c5":
+            parts.append(f"lvl{normalized_levels}")
+        if any(
+            getattr(args, name, None)
+            for name in ("fpn_adapter_size_map", "fpn_compression_map", "fpn_simple_map")
+        ):
+            parts.append("lvlmap")
 
     return "_".join(parts)
 
@@ -76,6 +98,33 @@ def resolve_run_dir(args):
 
     run_name = build_run_name(args)
     return os.path.join(os.path.abspath(args.save_dir), run_name)
+
+
+def resolve_results_json_path(args, run_dir):
+    default_file_name = "evaluate.json" if getattr(args, "evaluate", False) else "experiment_summary.json"
+    raw_value = getattr(args, "results_json", None)
+    if not raw_value:
+        return os.path.join(run_dir, default_file_name)
+
+    raw_value = str(raw_value).strip()
+    if not raw_value:
+        return os.path.join(run_dir, default_file_name)
+
+    has_explicit_dir = os.path.isabs(raw_value) or bool(os.path.dirname(raw_value))
+    if has_explicit_dir:
+        return raw_value if raw_value.endswith(".json") else f"{raw_value}.json"
+
+    base_dir = None
+    if getattr(args, "pretrained", None):
+        base_dir = os.path.dirname(os.path.abspath(args.pretrained))
+    elif getattr(args, "resume", None):
+        base_dir = os.path.dirname(os.path.abspath(args.resume))
+
+    if not base_dir:
+        base_dir = os.path.abspath(run_dir)
+
+    file_name = raw_value if raw_value.endswith(".json") else f"{raw_value}.json"
+    return os.path.join(base_dir, file_name)
 
 
 def _to_serializable(value):
@@ -114,10 +163,12 @@ def build_experiment_summary(
     total_params = model.get_num_total_params()
     adapter_params = model.get_num_adapter_params()
     frozen_params = model.get_num_frozen_params()
+    effective_train_augment = "none" if getattr(args, "evaluate", False) or args.dataset != "wire_hole" else args.train_augment
 
     config = {
         "mode": args.mode,
         "dataset": args.dataset,
+        "head_type": getattr(args, "head_type", "prompt"),
         "num_classes": args.num_classes,
         "image_size": args.image_size,
         "batch_size": args.batch_size,
@@ -132,7 +183,10 @@ def build_experiment_summary(
         "resume": args.resume,
         "subset_ratio": args.subset_ratio,
         "subset_seed": args.subset_seed,
+        "train_augment": effective_train_augment,
+        "augment_strength": args.augment_strength if effective_train_augment != "none" else None,
         "adapter_size": args.adapter_size,
+        "adapter_kind": getattr(args, "adapter_kind", "wirecr"),
         "compression_ratio": args.compression_ratio,
         "use_residual": args.use_residual,
         "adapter_simple": args.adapter_simple,
@@ -146,6 +200,12 @@ def build_experiment_summary(
         "boundary_loss_weight": args.boundary_loss_weight,
         "cldice_weight": args.cldice_weight,
         "hole_class_weight": args.hole_class_weight,
+        "main_class_weights": list(getattr(args, "main_class_weights", [1.0, 1.5, 4.0])),
+        "hole_aux_weight": getattr(args, "hole_aux_weight", 0.3),
+        "fpn_adapter_levels": getattr(args, "fpn_adapter_levels", "c4,c5"),
+        "fpn_adapter_size_map": getattr(args, "fpn_adapter_size_map", None),
+        "fpn_compression_map": getattr(args, "fpn_compression_map", None),
+        "fpn_simple_map": getattr(args, "fpn_simple_map", None),
         "save_dir": args.save_dir,
         "run_name": build_run_name(args),
     }
@@ -162,7 +222,12 @@ def build_experiment_summary(
             "test_samples": int(test_samples),
         },
         "model": {
-            "adapter_variant": "none" if args.disable_adapter else ("simple" if args.adapter_simple else "full"),
+            "head_type": getattr(args, "head_type", "prompt"),
+            "adapter_variant": (
+                "none"
+                if args.disable_adapter
+                else ("vanilla" if getattr(args, "adapter_kind", "wirecr") == "vanilla" else ("simple" if args.adapter_simple else "full"))
+            ),
             "total_params": int(total_params),
             "adapter_params": int(adapter_params),
             "frozen_params": int(frozen_params),

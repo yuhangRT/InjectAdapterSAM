@@ -12,14 +12,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from dataset.sam_dataset import get_dataset_class_names, get_sam_dataloader, validate_dataset_config
 from utils import logger
-from utils.experiment_io import build_experiment_summary, resolve_run_dir, write_json
+from utils.experiment_io import build_experiment_summary, resolve_results_json_path, resolve_run_dir, write_json
 from utils.init import init_device, init_sam_model
 from utils.parser import args
 from utils.scheduler import FakeLR, WarmUpCosineAnnealingLR
-from utils.solver import SAMCriterion, SAMTester, SAMTrainer
+from utils.solver import SAMCriterion, SAMFPNCriterion, SAMTester, SAMTrainer
 
 
 def _build_dataloader(split, subset_ratio=1.0):
+    train_augment = args.train_augment if (split == "train" and not args.evaluate) else "none"
     return get_sam_dataloader(
         data_root=args.data_dir,
         split=split,
@@ -30,11 +31,22 @@ def _build_dataloader(split, subset_ratio=1.0):
         subset_ratio=subset_ratio,
         subset_seed=args.subset_seed,
         num_classes=args.num_classes,
+        train_augment=train_augment,
+        augment_strength=args.augment_strength,
     )
 
 
 def _validate_dataset_args():
     validate_dataset_config(args.dataset, args.num_classes)
+    if args.head_type == "fpn":
+        if args.dataset != "wire_hole" or args.num_classes != 3:
+            raise ValueError("The FPN head currently supports only --dataset wire_hole --num-classes 3.")
+
+
+def _effective_train_augment():
+    if args.evaluate or args.dataset != "wire_hole":
+        return "none"
+    return args.train_augment
 
 
 def _log_results(title, results):
@@ -87,7 +99,7 @@ def _export_summary(*, run_dir, class_names, model, train_loader, val_loader, te
         stage=stage,
     )
 
-    summary_path = args.results_json or os.path.join(run_dir, "experiment_summary.json")
+    summary_path = resolve_results_json_path(args, run_dir)
     write_json(summary_path, summary)
     logger.info(f"=> Structured summary saved to: {summary_path}")
 
@@ -108,6 +120,7 @@ def main():
     run_dir = resolve_run_dir(args)
 
     logger.info(f"=> Loading dataset: {args.dataset}")
+    logger.info(f"=> Head type: {args.head_type}")
     logger.info(f"=> Data directory: {args.data_dir}")
     logger.info(f"=> Subset ratio: {args.subset_ratio}")
     logger.info(f"=> Class names: {', '.join(class_names)}")
@@ -131,14 +144,24 @@ def main():
     model.to(device)
     model.print_model_info()
 
-    criterion = SAMCriterion(
-        num_classes=args.num_classes,
-        bce_weight=args.bce_weight,
-        dice_weight=args.dice_weight,
-        boundary_weight=args.boundary_loss_weight,
-        cldice_weight=args.cldice_weight,
-        hole_class_weight=args.hole_class_weight,
-    ).to(device)
+    if args.head_type == "prompt":
+        criterion = SAMCriterion(
+            num_classes=args.num_classes,
+            bce_weight=args.bce_weight,
+            dice_weight=args.dice_weight,
+            boundary_weight=args.boundary_loss_weight,
+            cldice_weight=args.cldice_weight,
+            hole_class_weight=args.hole_class_weight,
+        ).to(device)
+    else:
+        criterion = SAMFPNCriterion(
+            num_classes=args.num_classes,
+            class_weights=args.main_class_weights,
+            hole_aux_weight=args.hole_aux_weight,
+            boundary_weight=args.boundary_loss_weight,
+            cldice_weight=args.cldice_weight,
+            hole_class_weight=args.hole_class_weight,
+        ).to(device)
 
     if args.evaluate:
         logger.info("\n=> Running evaluation only...")
@@ -209,8 +232,12 @@ def main():
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info("  Learning rate: 1e-4")
     logger.info(f"  Scheduler: {args.scheduler}")
+    logger.info(f"  Head type: {args.head_type}")
     logger.info(f"  Validation frequency: every {args.val_freq} epoch(s)")
     logger.info(f"  Test frequency: every {args.test_freq} epoch(s)")
+    logger.info(f"  Train augmentation: {_effective_train_augment()}")
+    logger.info(f"  Augmentation strength: {args.augment_strength if _effective_train_augment() != 'none' else 'n/a'}")
+    logger.info(f"  Adapter kind: {args.adapter_kind}")
     logger.info(f"  Adapter size: {args.adapter_size}")
     logger.info(f"  Compression ratio: 1/{args.compression_ratio}")
     logger.info(f"  Class-aware prompts: {args.class_aware_prompts}")
@@ -219,6 +246,13 @@ def main():
     logger.info(f"  Boundary loss weight: {args.boundary_loss_weight}")
     logger.info(f"  clDice weight: {args.cldice_weight}")
     logger.info(f"  Hole class weight: {args.hole_class_weight}")
+    logger.info(f"  Main class weights: {args.main_class_weights}")
+    logger.info(f"  Hole auxiliary weight: {args.hole_aux_weight}")
+    if args.head_type == "fpn":
+        logger.info(f"  FPN adapter levels: {args.fpn_adapter_levels}")
+        logger.info(f"  FPN adapter size map: {args.fpn_adapter_size_map or 'default'}")
+        logger.info(f"  FPN compression map: {args.fpn_compression_map or 'default'}")
+        logger.info(f"  FPN simple map: {args.fpn_simple_map or 'default'}")
     logger.info("")
 
     logger.info("=> Starting training...\n")

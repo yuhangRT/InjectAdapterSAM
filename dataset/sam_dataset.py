@@ -16,6 +16,8 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
+from .industrial_augment import build_train_augmentor
+
 try:
     from pycocotools.coco import COCO
 except ImportError:  # pragma: no cover - optional unless --dataset coco is used
@@ -47,6 +49,13 @@ WIRE_HOLE_RGB_PALETTE = {
     (0, 0, 0): 0,
     (0, 255, 0): 1,
     (255, 0, 0): 2,
+}
+WIRE_HOLE_LABEL_ALIASES = {
+    0: 0,
+    1: 1,
+    2: 2,
+    76: 1,
+    150: 2,
 }
 
 
@@ -185,6 +194,12 @@ def _remap_mask_values(mask_array: np.ndarray, num_classes: int) -> np.ndarray:
         return remapped
 
     unique_values = {int(value) for value in np.unique(mask_array).tolist()}
+    if num_classes == 3 and unique_values.issubset(set(WIRE_HOLE_LABEL_ALIASES)):
+        remapped = mask_array.astype(np.int64).copy()
+        for raw_value, class_idx in WIRE_HOLE_LABEL_ALIASES.items():
+            remapped[mask_array == raw_value] = class_idx
+        return remapped
+
     valid_values = set(range(num_classes))
     invalid_values = sorted(unique_values.difference(valid_values))
     if invalid_values:
@@ -221,6 +236,8 @@ class WireHoleDataset(Dataset):
         subset_seed=42,
         image_size=1024,
         num_classes=3,
+        train_augment="industrial",
+        augment_strength="medium",
     ):
         super().__init__()
 
@@ -228,6 +245,9 @@ class WireHoleDataset(Dataset):
         self.split = split
         self.image_size = image_size
         self.num_classes = num_classes
+        self.train_augment = train_augment if split == "train" else "none"
+        self.augment_strength = augment_strength
+        self.augmentor = build_train_augmentor(self.train_augment, self.augment_strength)
 
         image_dir, mask_dir = _resolve_split_dirs(self.data_root, split)
         samples = _list_samples(image_dir, mask_dir)
@@ -245,6 +265,11 @@ class WireHoleDataset(Dataset):
 
         image = Image.open(image_path)
         mask = Image.open(mask_path)
+
+        if self.augmentor is not None:
+            seed = (torch.initial_seed() + int(index)) % (2**32)
+            rng = np.random.default_rng(seed)
+            image, mask = self.augmentor(image, mask, rng)
 
         original_size = image.size[::-1]
         image_tensor = _resize_image(image, self.image_size)
@@ -273,6 +298,8 @@ class CocoForegroundDataset(Dataset):
         subset_seed=42,
         image_size=1024,
         num_classes=2,
+        train_augment="none",
+        augment_strength="medium",
     ):
         super().__init__()
 
@@ -350,6 +377,8 @@ def get_sam_dataloader(
     subset_ratio=1.0,
     subset_seed=42,
     num_classes=3,
+    train_augment="industrial",
+    augment_strength="medium",
 ):
     validate_dataset_config(dataset_name, num_classes)
 
@@ -365,6 +394,8 @@ def get_sam_dataloader(
         subset_seed=subset_seed,
         image_size=image_size,
         num_classes=num_classes,
+        train_augment=train_augment if dataset_name == "wire_hole" else "none",
+        augment_strength=augment_strength,
     )
 
     return DataLoader(
