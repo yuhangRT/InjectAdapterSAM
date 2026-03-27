@@ -9,6 +9,8 @@
 
 完整中文说明见 [使用说明.md](./使用说明.md)。
 
+实例分割新主线 `WireCR-InstSAM` 的说明见 [WireCR-InstSAM使用文档.md](./WireCR-InstSAM使用文档.md)。
+
 ## 当前特性
 
 - SAM `vit_b` / `vit_l` / `vit_h` 三种主干
