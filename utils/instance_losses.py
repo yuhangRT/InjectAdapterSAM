@@ -25,7 +25,7 @@ class CenterNetProposalLoss(nn.Module):
         alpha: float = 2.0,
         beta: float = 4.0,
         hole_positive_weight: float = 1.5,
-        size_weight: float = 1.0,
+        size_weight: float = 0.1,
         offset_weight: float = 1.0,
     ) -> None:
         super().__init__()

@@ -97,6 +97,11 @@ class SAM1Backend(SAMBackendBase):
         return int(self.image_encoder.patch_embed.proj.out_channels)
 
     def preprocess(self, image: torch.Tensor) -> torch.Tensor:
+        # The instance dataloader emits float images in [0, 1], while the
+        # original SAM pixel mean/std are defined for 0-255 RGB inputs.
+        # Keep already-unscaled inputs unchanged.
+        if image.is_floating_point() and float(image.detach().amax().item()) <= 1.5:
+            image = image * 255.0
         pixel_mean = self.sam_model.pixel_mean.to(device=image.device, dtype=image.dtype)
         pixel_std = self.sam_model.pixel_std.to(device=image.device, dtype=image.dtype)
         image = (image - pixel_mean) / pixel_std

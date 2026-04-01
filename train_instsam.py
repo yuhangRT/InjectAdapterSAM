@@ -216,7 +216,7 @@ def main() -> None:
             f"Epoch {epoch + 1}/{args.epochs} | loss={avg_loss:.4f} | "
             f"proposal_recall@100={avg_proposal_recall:.4f} | hole_recall={avg_hole_recall:.4f}"
         )
-        score = avg_loss * -1.0 if avg_hole_recall < 0 else (avg_hole_recall if args.phase == "proposal" else avg_proposal_recall + avg_hole_recall)
+        score = avg_loss * -1.0 if avg_hole_recall < 0 else (avg_proposal_recall + avg_hole_recall)
         last_path = os.path.join(run_dir, "last.pth")
         save_checkpoint(last_path, model=model, optimizer=optimizer, epoch=epoch, extra={"phase": args.phase})
         if score > best_metric:

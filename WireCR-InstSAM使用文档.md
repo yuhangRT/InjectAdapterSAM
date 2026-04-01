@@ -286,6 +286,12 @@ Oracle 主要看：
 - WireCR adapters
 - CenterNet-lite proposal head
 
+当前默认组合：
+
+- `stride = 8`
+- `size_weight = 0.1`
+- `hole_positive_weight = 5.0`
+
 示例命令：
 
 ```bash
@@ -296,23 +302,22 @@ CUDA_VISIBLE_DEVICES=2 python3 train_instsam.py \
   --sam-model-type vit_b \
   --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
   --image-size 1024 \
-  --batch-size 4 \
+  --batch-size 2 \
   --workers 8 \
   --persistent-workers \
   --prefetch-factor 4 \
   --amp \
   --amp-dtype bf16 \
   --channels-last \
-  --epochs 20 \
+  --epochs 150 \
   --lr 1e-4 \
   --seed 42 \
   --topk-per-class 64 \
   --proposal-box-nms-iou 0.5 \
-  --hole-positive-weight 1.5 \
-  --train-metrics-interval 20 \
-  --run-name wirecr_instsam_v1_proposal \
+  --hole-positive-weight 5.0 \
+  --train-metrics-interval 5 \
+  --run-name wirecr_instsam_v1_proposal_s8_sz01_hole5_gpu2_bs2_e150_ampbf16 \
   --save-dir ./checkpoints
-
 ```
 
 主要日志指标：
@@ -337,7 +342,7 @@ CUDA_VISIBLE_DEVICES=0 python3 eval_instsam.py \
   --sam-backend sam1 \
   --sam-model-type vit_b \
   --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
-  --checkpoint ./checkpoints/wirecr_instsam_v1_proposal/best.pth \
+  --checkpoint ./checkpoints/wirecr_instsam_v1_proposal_s8_sz01_hole5_gpu2_bs2_e150_ampbf16/best.pth \
   --seed 42 \
   --gpu 0 \
   --topk-final 50 \
@@ -355,7 +360,7 @@ CUDA_VISIBLE_DEVICES=0 python3 eval_instsam.py \
   --sam-backend sam1 \
   --sam-model-type vit_b \
   --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
-  --checkpoint ./checkpoints/wirecr_instsam_v1_proposal/best.pth \
+  --checkpoint ./checkpoints/wirecr_instsam_v1_proposal_s8_sz01_hole5_gpu2_bs2_e150_ampbf16/best.pth \
   --seed 42 \
   --gpu 0 \
   --topk-final 50 \
@@ -389,9 +394,9 @@ CUDA_VISIBLE_DEVICES=0 python3 train_instsam.py \
   --gpu 0 \
   --topk-per-class 64 \
   --proposal-box-nms-iou 0.5 \
-  --hole-positive-weight 1.5 \
+  --hole-positive-weight 5.0 \
   --refine-gt-ratio 0.5 \
-  --resume ./checkpoints/wirecr_instsam_v1_proposal/best.pth \
+  --resume ./checkpoints/wirecr_instsam_v1_proposal_s8_sz01_hole5_gpu2_bs2_e150_ampbf16/best.pth \
   --run-name wirecr_instsam_v1_refine \
   --save-dir ./checkpoints
 
@@ -428,7 +433,7 @@ CUDA_VISIBLE_DEVICES=0 python3 train_instsam.py \
   --gpu 0 \
   --topk-per-class 64 \
   --proposal-box-nms-iou 0.5 \
-  --hole-positive-weight 1.5 \
+  --hole-positive-weight 5.0 \
   --refine-gt-ratio 0.5 \
   --resume ./checkpoints/wirecr_instsam_v1_refine/best.pth \
   --run-name wirecr_instsam_v1_joint \
@@ -647,13 +652,29 @@ pip install -e ./third_party/sam
 如果你现在只追求先把实例主线跑通，最稳妥的写法就是：
 
 ```bash
-python3 train_instsam.py \
+CUDA_VISIBLE_DEVICES=2 python3 train_instsam.py \
   --phase proposal \
   --data-dir ./samDataset_instance_coco \
   --sam-backend sam1 \
   --sam-model-type vit_b \
   --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
-  --run-name wirecr_instsam_v1_proposal
+  --image-size 1024 \
+  --batch-size 2 \
+  --workers 8 \
+  --persistent-workers \
+  --prefetch-factor 4 \
+  --amp \
+  --amp-dtype bf16 \
+  --channels-last \
+  --epochs 150 \
+  --lr 1e-4 \
+  --seed 42 \
+  --topk-per-class 64 \
+  --proposal-box-nms-iou 0.5 \
+  --hole-positive-weight 5.0 \
+  --train-metrics-interval 5 \
+  --run-name wirecr_instsam_v1_proposal_s8_sz01_hole5_gpu2_bs2_e150_ampbf16 \
+  --save-dir ./checkpoints
 ```
 
 先把 proposal-only 跑通，再进 refine-only 和 joint。

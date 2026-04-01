@@ -93,6 +93,7 @@ class CenterNetLiteProposalHead(nn.Module):
         self.fuse_c3 = ConvBN(in_channels, feat_channels, 3)
         self.fuse_c4 = ConvBN(in_channels, feat_channels, 3)
         self.fuse_c5 = ConvBN(in_channels, feat_channels, 3)
+        self.merge_conv = ConvBN(feat_channels * 3, feat_channels, 1)
         self.fuse = nn.Sequential(
             ConvBN(feat_channels, feat_channels, 3),
             nn.GELU(),
@@ -107,7 +108,8 @@ class CenterNetLiteProposalHead(nn.Module):
         nn.init.constant_(self.center_head.bias, -2.19)
 
     def forward(self, features: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        fused = self.fuse_c3(features["c3"]) + self.fuse_c4(features["c4"]) + self.fuse_c5(features["c5"])
+        fused = torch.cat([self.fuse_c3(features["c3"]), self.fuse_c4(features["c4"]), self.fuse_c5(features["c5"])], dim=1)
+        fused = self.merge_conv(fused)
         fused = self.fuse(fused)
         return {
             "center_heatmap": self.center_head(fused),
@@ -144,6 +146,8 @@ class CenterNetLiteProposalHead(nn.Module):
                 box_width = float((box[2] - box[0]).item() / self.stride)
                 box_height = float((box[3] - box[1]).item() / self.stride)
                 radius = _gaussian_radius(box_height, box_width)
+                if int(label.item()) == 2:
+                    radius = max(radius, 2)
                 heatmap_np = heatmap[batch_idx, int(label.item()) - 1].numpy()
                 _draw_gaussian(heatmap_np, (grid_x, grid_y), radius)
                 heatmap[batch_idx, int(label.item()) - 1] = torch.from_numpy(heatmap_np)

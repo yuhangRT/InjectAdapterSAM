@@ -51,6 +51,6 @@ def add_common_instsam_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--enable-roi-refiner", action="store_true", default=False)
     parser.add_argument("--topk-per-class", type=int, default=64)
     parser.add_argument("--proposal-box-nms-iou", type=float, default=0.5)
-    parser.add_argument("--hole-positive-weight", type=float, default=1.5)
+    parser.add_argument("--hole-positive-weight", type=float, default=5.0)
     parser.add_argument("--save-dir", type=str, default="./checkpoints")
     parser.add_argument("--run-name", type=str, default=None)
