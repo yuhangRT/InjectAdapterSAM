@@ -1,5 +1,7 @@
 """
-Evaluation entrypoint for WireCR-InstSAM.
+Legacy WireCR-InstSAM evaluation entrypoint.
+
+This file is historical only. New mainline code must not import it.
 """
 
 from __future__ import annotations

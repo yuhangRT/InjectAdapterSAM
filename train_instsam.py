@@ -1,5 +1,7 @@
 """
-Training entrypoint for WireCR-InstSAM.
+Legacy WireCR-InstSAM training entrypoint.
+
+This file is historical only. New mainline code must not import it.
 """
 
 from __future__ import annotations

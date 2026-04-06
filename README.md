@@ -1,327 +1,200 @@
 # InjectAdapterSAM
 
-`InjectAdapterSAM` 将 CRNet 风格的多尺度卷积适配器接入 SAM（Segment Anything Model），形成当前仓库里的 `WireCR-SAM` 实验主线。
+`WireCRHQInstSAM` is now the primary instance-segmentation mainline in this repository.
 
-当前代码的定位已经固定为两类任务：
+The maintained path is:
 
-- `wire_hole`：主任务，工业机床电路线束与接口孔洞三类语义分割
-- `coco`：辅任务，COCO 类别无关前景分割，仅用于辅助实验、迁移或烟测
+- training: `train_wirecr_hqinstsam.py`
+- evaluation: `eval_wirecr_hqinstsam.py`
+- inference: `infer_wirecr_hqinstsam.py`
+- config: `configs/wirecr_hqinstsam_vitb.yaml`
 
-完整中文说明见 [使用说明.md](./使用说明.md)。
+Legacy modules are preserved only for history and must not be imported by the new mainline:
 
-实例分割新主线 `WireCR-InstSAM` 的说明见 [WireCR-InstSAM使用文档.md](./WireCR-InstSAM使用文档.md)。
+- `train_instsam.py`
+- `eval_instsam.py`
+- `infer_instsam.py`
+- `models/sam_wrapper.py`
+- `models/sam_fpn_segmentor.py`
+- `models/wirecr_instsam.py`
 
-## 当前特性
+## Task Definition
 
-- SAM `vit_b` / `vit_l` / `vit_h` 三种主干
-- `small` / `medium` / `large` 三种 WireCR 适配器
-- `4 / 8 / 16 / 32 / 64` 五种压缩比
-- 自动类感知 prompts，不再依赖旧版 `prompt-strategy` / `num-prompts`
-- 多类 BCE + Dice + Boundary + clDice 损失
-- `wire_hole` 主任务 + `coco` 辅助任务共用同一套训练入口
+The new mainline only maintains two instance classes:
 
-## 安装
+- `label_sleeve` (`wire`)
+- `empty_terminal` (`interface-hole`)
 
-```bash
-git clone git@github.com:yuhangRT/InjectAdapterSAM.git
-cd InjectAdapterSAM
-git submodule update --init --recursive
+Each prediction produces:
 
-pip install -r requirements_sam.txt
-```
+- `boxes`
+- `labels`
+- `scores`
+- `masks`
+- `prompt_meta`
+- `rectified_crop` for `label_sleeve` exports
 
-下载 SAM 权重：
+## Data Preparation
 
-```bash
-mkdir -p checkpoints
-
-wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_b_01ec64.pth -P checkpoints/
-# 或
-wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_l_0b3195.pth -P checkpoints/
-# 或
-wget https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth -P checkpoints/
-```
-
-## 数据集
-
-### 1. `wire_hole`（主任务）
-
-标签定义：
-
-- `0`: background
-- `1`: wire
-- `2`: interface-hole
-
-支持以下任一目录结构：
-
-```text
-<data-root>/
-├── images/
-│   ├── train/
-│   ├── val/
-│   └── test/
-└── masks/
-    ├── train/
-    ├── val/
-    └── test/
-```
-
-或：
-
-```text
-<data-root>/
-├── train/
-│   ├── images/
-│   └── masks/
-├── val/
-│   ├── images/
-│   └── masks/
-└── test/
-    ├── images/
-    └── masks/
-```
-
-`labels/` 也可以替代 `masks/`。
-
-如果你的原始数据是当前仓库里的 `samDataset/` 这种平铺 ISAT 结构：
-
-```text
-samDataset/
-├── image_sam_002.jpg
-├── image_sam_002.json
-├── ...
-└── isat.yaml
-```
-
-请先离线转换成 `wire_hole` 目录，而不是直接把 JSON 喂给训练脚本：
+Convert ISAT annotations to the new COCO v2 format:
 
 ```bash
-python3 scripts/convert_isat_to_wire_hole.py \
+python3 scripts/convert_isat_to_coco_v2.py \
   --src ./samDataset \
-  --dst ./samDataset_wire_hole \
-  --seed 42
+  --dst ./samDataset_instance_coco \
+  --split-mode dedupe \
+  --dedupe-threshold 6
 ```
 
-转换脚本会：
-
-- 按 `0=background, 1=wire, 2=interface-hole` 导出单通道 PNG mask
-- 自动生成 `images/train|val|test` 和 `masks/train|val|test`
-- 按 `int(0.8N)` / `int(0.9N)` 切点生成 `94/12/12` 的当前 split
-
-说明：
-
-- 不需要在 JSON 里单独标注 `background`
-- 背景来自未被 `wire` 或 `interface-hole` 多边形覆盖的像素
-- 若保留彩色 mask，固定颜色必须是黑=`background`、绿=`wire`、红=`interface-hole`
-
-### 2. `coco`（辅助任务）
-
-当前实现不是 COCO 多类实例分割，而是“把同一张图里的所有实例合并成前景”的二类语义分割：
-
-- `0`: background
-- `1`: foreground
-
-必须使用：
+Visualize dataset samples:
 
 ```bash
---dataset coco --num-classes 2
+python3 scripts/visualize_dataset_v2.py \
+  --data-root ./samDataset_instance_coco \
+  --split train \
+  --output-dir ./tmp_vis_v2 \
+  --limit 8
 ```
 
-支持以下任一结构：
+## Training
 
-```text
-<data-root>/
-├── train2017/
-├── val2017/
-└── annotations/
-    ├── instances_train2017.json
-    └── instances_val2017.json
-```
-
-或：
-
-```text
-<data-root>/
-├── images/
-│   ├── train2017/
-│   └── val2017/
-└── annotations/
-    ├── instances_train2017.json
-    └── instances_val2017.json
-```
-
-## 训练
-
-### `wire_hole` 主任务
+Standard training:
 
 ```bash
-python main_sam.py \
-  --mode sam \
-  --data-dir /path/to/wire_hole \
-  --dataset wire_hole \
-  --num-classes 3 \
-  --sam-model-type vit_b \
-  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
-  --batch-size 1 \
-  --workers 0 \
-  --epochs 100 \
-  --adapter-size small \
-  --compression-ratio 16 \
-  --class-aware-prompts \
-  --boundary-loss-weight 0.1 \
-  --cldice-weight 0.1 \
-  --hole-class-weight 2.0
+python3 train_wirecr_hqinstsam.py \
+  --config configs/wirecr_hqinstsam_vitb.yaml \
+  --output-dir ./runs/wirecr_hqinstsam_vitb
 ```
 
-### `coco` 辅助任务
+Useful overrides:
 
 ```bash
-python main_sam.py \
-  --mode sam \
-  --data-dir /path/to/coco \
-  --dataset coco \
-  --num-classes 2 \
-  --sam-model-type vit_b \
-  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
-  --batch-size 1 \
-  --workers 0 \
-  --epochs 10 \
-  --adapter-size small \
-  --compression-ratio 16 \
-  --class-aware-prompts \
-  --boundary-loss-weight 0.1 \
-  --cldice-weight 0.0
+python3 train_wirecr_hqinstsam.py \
+  --config configs/wirecr_hqinstsam_vitb.yaml \
+  --output-dir ./runs/wirecr_hqinstsam_debug \
+  --set train.epochs=2 \
+  --set train.batch_size=1 \
+  --set train.val_batch_size=1 \
+  --set train.workers=0
 ```
 
-## 评估
+Resume training:
 
 ```bash
-python main_sam.py \
-  --mode sam \
-  --evaluate \
-  --data-dir /path/to/wire_hole \
-  --dataset wire_hole \
-  --num-classes 3 \
-  --sam-model-type vit_b \
-  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
-  --pretrained ./checkpoints/wirecrsam_wire_hole_small_cr16/best_iou.pth \
-  --batch-size 1 \
-  --workers 0 \
-  --adapter-size small \
-  --compression-ratio 16
+python3 train_wirecr_hqinstsam.py \
+  --config configs/wirecr_hqinstsam_vitb.yaml \
+  --resume ./runs/wirecr_hqinstsam_vitb/last.pth
 ```
 
-每次训练或评估结束后，程序会在对应运行目录下自动写出 `experiment_summary.json`。如需显式指定输出位置，可额外传入：
+Checkpoints written by the unified trainer:
+
+- `last.pth`
+- `best_ap.pth`
+- `best_ap50.pth`
+- `best_hole_recall.pth`
+
+Checkpoint metadata includes:
+
+- `best_val_thresholds`
+- `val_metrics_summary`
+- `config_snapshot`
+
+## Evaluation
+
+Run validation with threshold search:
 
 ```bash
---run-name your_run_name \
---save-dir ./checkpoints \
---results-json ./checkpoints/your_run_name/experiment_summary.json
+python3 eval_wirecr_hqinstsam.py \
+  --config configs/wirecr_hqinstsam_vitb.yaml \
+  --checkpoint ./runs/wirecr_hqinstsam_vitb/best_ap.pth \
+  --output ./runs/wirecr_hqinstsam_vitb/eval_metrics.json
 ```
 
-## 论文实验脚本
-
-### 1. 运行表 4-2 到表 4-5 的实验套件
-
-下面的脚本会直接调用当前 `main_sam.py`，并为每个表生成一份 manifest：
+Export the thresholds stored in a checkpoint:
 
 ```bash
-python scripts/run_thesis_suite.py \
-  --table 4-2 \
-  --output-root ./thesis_runs \
-  --data-dir /path/to/wire_hole \
-  --dataset wire_hole \
-  --num-classes 3 \
-  --sam-model-type vit_b \
-  --sam-checkpoint ./checkpoints/sam_vit_b_01ec64.pth \
-  --batch-size 1 \
-  --workers 0 \
-  --epochs 100 \
-  --adapter-size medium \
-  --compression-ratio 8
+python3 scripts/export_best_thresholds.py \
+  --checkpoint ./runs/wirecr_hqinstsam_vitb/best_ap.pth \
+  --output ./runs/wirecr_hqinstsam_vitb/best_thresholds.json
 ```
 
-支持：
+Metrics include:
 
-- `--table 4-2`：主对比实验
-- `--table 4-3`：结构消融
-- `--table 4-4`：损失消融
-- `--table 4-5`：少样本实验
-- `--table all`：依次运行全部套件
+- `mask_ap`
+- `AP50`
+- `AP75`
+- `per_class_AP50`
+- `empty_terminal_recall`
+- `label_sleeve_boundary_f1`
+- `mean_mask_iou`
+- `count_mae`
+- `merge_error_count`
+- `split_error_count`
 
-只想先看将要执行的命令时，可加 `--dry-run`。
+## Inference
 
-### 2. 直接导出 CSV
-
-表 4-1 导出主实验训练配置：
+Single image:
 
 ```bash
-python scripts/export_thesis_tables.py \
-  table4_1 \
-  --reference ./thesis_runs/table4_2/table4_2_wirecr_sam \
-  --output ./thesis_tables/table4_1.csv
+python3 infer_wirecr_hqinstsam.py \
+  --config configs/wirecr_hqinstsam_vitb.yaml \
+  --checkpoint ./runs/wirecr_hqinstsam_vitb/best_ap.pth \
+  --image ./demo/example.png \
+  --output-dir ./outputs/example
 ```
 
-表 4-2 导出主对比实验：
+Directory inference:
 
 ```bash
-python scripts/export_thesis_tables.py \
-  table4_2 \
-  --manifest ./thesis_runs/table4_2/manifest_table4_2.json \
-  --output ./thesis_tables/table4_2.csv
+python3 infer_wirecr_hqinstsam.py \
+  --config configs/wirecr_hqinstsam_vitb.yaml \
+  --checkpoint ./runs/wirecr_hqinstsam_vitb/best_ap.pth \
+  --image-dir ./demo/images \
+  --output-dir ./outputs/batch
 ```
 
-表 4-3 导出结构消融：
+Inference defaults:
+
+- sliding window: `1024`
+- overlap: `0.2`
+- thresholds: checkpoint `best_val_thresholds` first, YAML fallback second
+
+Exports:
+
+- `json/`
+- `vis/`
+- `masks/`
+- `rectified_crops/`
+
+## Overfit8
+
+Prepare and run the fixed 8-image overfit subset:
 
 ```bash
-python scripts/export_thesis_tables.py \
-  table4_3 \
-  --manifest ./thesis_runs/table4_3/manifest_table4_3.json \
-  --output ./thesis_tables/table4_3.csv
+sh scripts/run_overfit8.sh ./samDataset_instance_coco ./runs/overfit8
 ```
 
-表 4-4 导出损失消融：
+The script creates an `overfit8_data` subset and launches the unified trainer on it.
+
+## Tests
+
+Core regression suite:
 
 ```bash
-python scripts/export_thesis_tables.py \
-  table4_4 \
-  --manifest ./thesis_runs/table4_4/manifest_table4_4.json \
-  --output ./thesis_tables/table4_4.csv
+pytest tests/test_backbone_v2.py \
+  tests/test_pixel_decoder.py \
+  tests/test_query_head.py \
+  tests/test_prompt_builder_v2.py \
+  tests/test_hq_refiner.py \
+  tests/test_end2end_smoke.py \
+  tests/test_trainer_smoke.py \
+  tests/test_evaluator_metrics.py \
+  tests/test_infer_sliding_window.py -q
 ```
 
-表 4-5 导出少样本实验：
+## Known Limits
 
-```bash
-python scripts/export_thesis_tables.py \
-  table4_5 \
-  --manifest ./thesis_runs/table4_5/manifest_table4_5.json \
-  --output ./thesis_tables/table4_5.csv
-```
-
-## 关键参数
-
-| 参数 | 说明 |
-|------|------|
-| `--dataset` | `wire_hole` 或 `coco` |
-| `--num-classes` | `wire_hole=3`, `coco=2` |
-| `--sam-model-type` | `vit_b`, `vit_l`, `vit_h` |
-| `--adapter-size` | `small`, `medium`, `large` |
-| `--compression-ratio` | `4`, `8`, `16`, `32`, `64` |
-| `--class-aware-prompts` | 是否启用自动类感知 prompts |
-| `--freeze-encoder` | 是否冻结 SAM image encoder |
-| `--freeze-decoder` | 是否冻结 SAM mask decoder |
-| `--subset-ratio` | 训练集采样比例，支持少样本实验 |
-| `--boundary-loss-weight` | 边界损失权重 |
-| `--cldice-weight` | 细线结构 clDice 权重 |
-| `--hole-class-weight` | `wire_hole` 中 hole 类正样本权重 |
-| `--disable-adapter` | 关闭 WireCR adapter，作为无适配器对比基线 |
-| `--run-name` | 显式指定当前实验名 |
-| `--save-dir` | 指定实验输出根目录 |
-| `--results-json` | 指定结构化结果 JSON 输出路径 |
-
-## 说明
-
-- 论文主线请使用 `wire_hole`，`coco` 只建议作为辅助实验。
-- 当前推荐使用 `scripts/run_thesis_suite.py` 和 `scripts/export_thesis_tables.py` 组织论文实验。
-- `scripts/grid_search.sh` 和 `scripts/aggregate_results.py` 仍然是旧版 COCO/prompt 流程脚本，未同步到当前类感知 prompt 接口。
-- 如果你只是在 8GB 左右显存上验证可行性，优先使用 `vit_b + batch-size 1 + adapter-size small`。
+- `vit_b` is the only validated training path in the current mainline.
+- `vit_l` remains a compatibility template and has not passed the full regression path.
+- The current evaluator uses repository-local industrial metrics plus COCO mask evaluation when a COCO ground-truth handle is available.
+- Overfit8 acceptance still depends on actual training runtime and dataset availability.

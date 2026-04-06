@@ -1,5 +1,7 @@
 """
-WireCR-InstSAM V1 model.
+Legacy WireCR-InstSAM V1 model.
+
+This file is historical only. New mainline code must not import it.
 """
 
 from __future__ import annotations

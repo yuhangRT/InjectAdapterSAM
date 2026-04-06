@@ -1,5 +1,7 @@
 """
-WireCR-SAM FPN semantic segmentation head.
+Legacy WireCR-SAM FPN semantic segmentation head.
+
+This file is historical only. New mainline code must not import it.
 """
 
 from __future__ import annotations

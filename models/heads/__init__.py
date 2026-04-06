@@ -1,1 +1,1 @@
-from .instance_proposal_head import *
+"""Heads package for InjectAdapterSAM."""

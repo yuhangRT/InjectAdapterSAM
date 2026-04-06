@@ -1,0 +1,62 @@
+{
+  "runtime": {
+    "output_dir": "./runs/overfit8/overfit8_run",
+    "seed": 42,
+    "gpu": 0,
+    "resume": null
+  },
+  "data": {
+    "root": "./runs/overfit8/overfit8_data",
+    "train_split": "train",
+    "val_split": "val",
+    "image_size": 1024
+  },
+  "model": {
+    "name": "WireCRHQInstSAM",
+    "sam_model_type": "vit_b",
+    "num_queries": 64,
+    "query_decoder_layers": 6,
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0
+  },
+  "train": {
+    "epochs": 60,
+    "warmup_epochs": 20,
+    "batch_size": 1,
+    "val_batch_size": 1,
+    "workers": 0,
+    "lr_lora": 5e-05,
+    "lr_new_modules": 0.0002,
+    "weight_decay": 0.05,
+    "warmup_iters": 16,
+    "grad_accum_steps": 1,
+    "grad_clip_norm": 0.1,
+    "amp": true,
+    "val_interval": 5
+  },
+  "infer": {
+    "sliding_window": 1024,
+    "overlap": 0.2,
+    "score_thresh_label": "auto_from_val",
+    "score_thresh_hole": "auto_from_val"
+  },
+  "eval": {
+    "score_grid_label": [
+      0.2,
+      0.35,
+      0.5
+    ],
+    "score_grid_hole": [
+      0.2,
+      0.35,
+      0.5
+    ],
+    "mask_nms_iou_label_grid": [
+      0.6
+    ],
+    "mask_nms_iou_hole_grid": [
+      0.5
+    ]
+  }
+}

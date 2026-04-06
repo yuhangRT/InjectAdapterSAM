@@ -1,5 +1,7 @@
 """
-WireCR-SAM wrapper with class-aware prompts for automatic semantic segmentation.
+Legacy WireCR-SAM wrapper with class-aware prompts for automatic semantic segmentation.
+
+This file is historical only. New mainline code must not import it.
 """
 
 from typing import Any, Dict, List
