@@ -24,6 +24,37 @@ DEFAULT_CHECKPOINT_FILENAMES = {
 }
 
 
+def _filter_score_fusion_state(
+    model_state: Mapping[str, Any],
+    model_reference: Mapping[str, torch.Tensor],
+) -> dict[str, Any]:
+    score_fusion_keys = {key for key in model_reference.keys() if key.startswith("score_fusion.")}
+    if not score_fusion_keys:
+        return {
+            key: value
+            for key, value in model_state.items()
+            if not key.startswith("score_fusion.")
+        }
+
+    checkpoint_score_keys = {key for key in model_state.keys() if key.startswith("score_fusion.")}
+    compatible = checkpoint_score_keys == score_fusion_keys
+    if compatible:
+        for key in checkpoint_score_keys:
+            checkpoint_value = model_state[key]
+            reference_value = model_reference[key]
+            if tuple(checkpoint_value.shape) != tuple(reference_value.shape):
+                compatible = False
+                break
+
+    if compatible:
+        return dict(model_state)
+    return {
+        key: value
+        for key, value in model_state.items()
+        if not key.startswith("score_fusion.")
+    }
+
+
 def build_checkpoint_state(
     *,
     model: torch.nn.Module,
@@ -78,7 +109,16 @@ def load_checkpoint(
 ) -> dict[str, Any]:
     checkpoint_path = Path(path).expanduser().resolve()
     state = torch.load(checkpoint_path, map_location=map_location)
-    model.load_state_dict(state["model"])
+    model_reference = model.state_dict()
+    model_state = _filter_score_fusion_state(dict(state["model"]), model_reference)
+    incompatible = model.load_state_dict(model_state, strict=False)
+    missing_keys = [key for key in incompatible.missing_keys if not key.startswith("score_fusion.")]
+    unexpected_keys = [key for key in incompatible.unexpected_keys if not key.startswith("score_fusion.")]
+    if missing_keys or unexpected_keys:
+        raise RuntimeError(
+            "Error(s) in loading state_dict for "
+            f"{model.__class__.__name__}: missing_keys={missing_keys}, unexpected_keys={unexpected_keys}"
+        )
     if optimizer is not None and "optimizer" in state:
         optimizer.load_state_dict(state["optimizer"])
     if scheduler is not None and "scheduler" in state:

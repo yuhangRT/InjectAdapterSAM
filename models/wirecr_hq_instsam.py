@@ -172,6 +172,35 @@ class WireCRHQInstSAM(SAMBackboneV2):
         heights = (pred_boxes[:, 3] - pred_boxes[:, 1]).clamp(min=0.0)
         return (widths * heights).clamp(0.0, 1.0)
 
+    @staticmethod
+    def _gather_prompt_aligned_scores(
+        *,
+        prompt_meta: Sequence[Mapping[str, object]],
+        coarse_batch: Mapping[str, object],
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        coarse_class_scores = coarse_batch["class_scores"]
+        coarse_box_quality = coarse_batch["box_quality"]
+        coarse_mask_scores = coarse_batch["coarse_mask_score"]
+        count = len(prompt_meta)
+        class_scores = coarse_class_scores.new_zeros((count,), device=device)
+        box_quality = coarse_box_quality.new_zeros((count,), device=device)
+        coarse_mask_score = coarse_mask_scores.new_zeros((count,), device=device)
+        coarse_score_missing = torch.ones((count,), dtype=torch.bool, device=device)
+
+        for prompt_index, meta in enumerate(prompt_meta):
+            if meta.get("instance_source") != "pred":
+                continue
+            source_index = int(meta.get("source_index", -1))
+            if not (0 <= source_index < int(coarse_class_scores.shape[0])):
+                continue
+            class_scores[prompt_index] = coarse_class_scores[source_index]
+            box_quality[prompt_index] = coarse_box_quality[source_index]
+            coarse_mask_score[prompt_index] = coarse_mask_scores[source_index]
+            coarse_score_missing[prompt_index] = False
+
+        return class_scores, box_quality, coarse_mask_score, coarse_score_missing
+
     def build_prompts(
         self,
         coarse_outputs: Mapping[str, torch.Tensor | Dict[str, torch.Tensor] | Sequence[torch.Tensor]],
@@ -333,6 +362,7 @@ class WireCRHQInstSAM(SAMBackboneV2):
                         "class_scores": images.new_zeros((0,)),
                         "box_quality": images.new_zeros((0,)),
                         "coarse_mask_score": images.new_zeros((0,)),
+                        "coarse_score_missing": torch.zeros((0,), dtype=torch.bool, device=images.device),
                         "prompt_meta": prompt_meta,
                     }
                 )
@@ -368,19 +398,11 @@ class WireCRHQInstSAM(SAMBackboneV2):
                         source_query_indices.append(-1)
                 else:
                     source_query_indices.append(-1)
-            count = int(boxes_xyxy.shape[0])
-            class_scores = coarse_batch["class_scores"]
-            box_quality = coarse_batch["box_quality"]
-            coarse_mask_score = coarse_batch["coarse_mask_score"]
-            if class_scores.shape[0] < count:
-                pad_size = count - class_scores.shape[0]
-                class_scores = torch.cat((class_scores, boxes_xyxy.new_full((pad_size,), 0.5)), dim=0)
-                box_quality = torch.cat((box_quality, boxes_xyxy.new_ones((pad_size,))), dim=0)
-                coarse_mask_score = torch.cat((coarse_mask_score, boxes_xyxy.new_full((pad_size,), 0.5)), dim=0)
-            else:
-                class_scores = class_scores[:count]
-                box_quality = box_quality[:count]
-                coarse_mask_score = coarse_mask_score[:count]
+            class_scores, box_quality, coarse_mask_score, coarse_score_missing = self._gather_prompt_aligned_scores(
+                prompt_meta=prompt_meta,
+                coarse_batch=coarse_batch,
+                device=boxes_xyxy.device,
+            )
 
             quality_scores = self.quality_head(
                 decoder_outputs["refine_features"],
@@ -399,6 +421,7 @@ class WireCRHQInstSAM(SAMBackboneV2):
                     "class_scores": class_scores,
                     "box_quality": box_quality,
                     "coarse_mask_score": coarse_mask_score,
+                    "coarse_score_missing": coarse_score_missing,
                     "source_query_indices": torch.as_tensor(
                         source_query_indices,
                         dtype=torch.long,
@@ -423,6 +446,7 @@ class WireCRHQInstSAM(SAMBackboneV2):
                 box_quality=batch["box_quality"],
                 coarse_mask_score=batch["coarse_mask_score"],
                 refine_quality_score=batch["quality_scores"],
+                coarse_score_missing=batch["coarse_score_missing"],
             )
             fused_batches.append({**batch, "instance_scores": instance_scores})
         return {
@@ -434,6 +458,7 @@ class WireCRHQInstSAM(SAMBackboneV2):
         fused_outputs: Mapping[str, object],
         *,
         score_threshold: float = 0.05,
+        mask_prob_thresh: float = 0.5,
     ) -> Dict[str, object]:
         instances = []
         for batch in fused_outputs["fused_batches"]:
@@ -442,7 +467,7 @@ class WireCRHQInstSAM(SAMBackboneV2):
                 continue
 
             refined_logits = batch["refined_mask_logits"][:, 0]
-            binary_masks = refined_logits > 0
+            binary_masks = refined_logits.sigmoid() > float(mask_prob_thresh)
             keep_indices = self.mask_nms(
                 binary_masks,
                 batch["instance_scores"],
@@ -453,12 +478,15 @@ class WireCRHQInstSAM(SAMBackboneV2):
                 score = float(batch["instance_scores"][keep_index].item())
                 if score < score_threshold:
                     continue
+                mask = binary_masks[keep_index]
+                if int(mask.sum().item()) <= 0:
+                    continue
                 sample_instances.append(
                     {
                         "label": int(batch["labels"][keep_index].item()),
                         "box": batch["boxes_xyxy"][keep_index].detach().cpu(),
                         "mask_logits": batch["refined_mask_logits"][keep_index, 0].detach().cpu(),
-                        "mask": binary_masks[keep_index].detach().cpu(),
+                        "mask": mask.detach().cpu(),
                         "instance_score": score,
                         "quality_score": float(batch["quality_scores"][keep_index].item()),
                         "class_score": float(batch["class_scores"][keep_index].item()),
@@ -481,6 +509,7 @@ class WireCRHQInstSAM(SAMBackboneV2):
         gt_ratio: float | None = None,
         generator: torch.Generator | None = None,
         score_threshold: float = 0.05,
+        mask_prob_thresh: float = 0.5,
     ) -> Dict[str, object]:
         if prompt_source is None:
             prompt_source = "gt" if targets is not None and self.training else "pred"
@@ -508,7 +537,11 @@ class WireCRHQInstSAM(SAMBackboneV2):
             generator=generator,
         )
         fused_outputs = self.fuse_scores(refine_outputs)
-        postprocessed = self.postprocess_instances(fused_outputs, score_threshold=score_threshold)
+        postprocessed = self.postprocess_instances(
+            fused_outputs,
+            score_threshold=score_threshold,
+            mask_prob_thresh=mask_prob_thresh,
+        )
 
         return {
             "training_dict": {

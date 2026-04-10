@@ -3,6 +3,7 @@ set -eu
 
 # Prefer the environment's CUDA-enabled torch over any user-site override.
 export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 if [ "$#" -lt 2 ]; then
   echo "Usage: $0 <coco_root> <output_dir> [config_path]" >&2
@@ -15,10 +16,11 @@ CONFIG_PATH="${3:-configs/wirecr_hqinstsam_vitb.yaml}"
 SUBSET_ROOT="${OUTPUT_DIR}/overfit8_data"
 RUN_DIR="${OUTPUT_DIR}/overfit8_run"
 RESUME_ARG=""
+FORCE_FRESH="${OVERFIT_FORCE_FRESH:-1}"
 
 mkdir -p "${SUBSET_ROOT}/annotations" "${SUBSET_ROOT}/images/train" "${SUBSET_ROOT}/images/val"
 
-python3 - <<'PY' "${COCO_ROOT}" "${SUBSET_ROOT}"
+"${PYTHON_BIN}" - <<'PY' "${COCO_ROOT}" "${SUBSET_ROOT}"
 import json
 import shutil
 import sys
@@ -62,34 +64,39 @@ for image in images:
 shutil.copy2(dst_ann, subset_root / "annotations" / "instances_val.json")
 PY
 
-if [ -f "${RUN_DIR}/last.pth" ]; then
+if [ "${FORCE_FRESH}" != "1" ] && [ -f "${RUN_DIR}/last.pth" ]; then
   RESUME_ARG="--set runtime.resume=${RUN_DIR}/last.pth"
 fi
 
-python3 train_wirecr_hqinstsam.py \
+"${PYTHON_BIN}" train_wirecr_hqinstsam.py \
   --config "${CONFIG_PATH}" \
   --output-dir "${RUN_DIR}" \
   ${RESUME_ARG} \
   --set "data.root=${SUBSET_ROOT}" \
   --set "data.train_split=train" \
   --set "data.val_split=val" \
-  --set "data.full_image_prob=1.0" \
-  --set "data.object_crop_prob=0.0" \
-  --set "data.hole_focused_prob=0.0" \
-  --set "data.label_focused_prob=0.0" \
-  --set "train.epochs=60" \
-  --set "train.warmup_epochs=20" \
+  --set "data.full_image_prob=0.5" \
+  --set "data.object_crop_prob=0.5" \
+  --set "data.hole_focused_prob=0.6" \
+  --set "data.label_focused_prob=0.4" \
+  --set "train.epochs=90" \
+  --set "train.warmup_epochs=8" \
   --set "train.batch_size=1" \
   --set "train.val_batch_size=1" \
   --set "train.grad_accum_steps=1" \
+  --set "train.amp=false" \
+  --set "train.lr_lora=1e-5" \
+  --set "train.lr_new_modules=5e-5" \
+  --set "train.grad_clip_norm=0.05" \
   --set "train.workers=4" \
   --set "train.val_workers=2" \
   --set "train.pin_memory=true" \
   --set "train.persistent_workers=true" \
   --set "train.prefetch_factor=2" \
-  --set "train.warmup_iters=16" \
-  --set "train.val_interval=5" \
-  --set "eval.score_grid_label=[0.2,0.35,0.5]" \
-  --set "eval.score_grid_hole=[0.2,0.35,0.5]" \
-  --set "eval.mask_nms_iou_label_grid=[0.6]" \
-  --set "eval.mask_nms_iou_hole_grid=[0.5]"
+  --set "train.warmup_iters=32" \
+  --set "train.val_interval=10" \
+  --set "eval.score_grid_label=[0.2,0.35,0.5,0.65,0.8]" \
+  --set "eval.score_grid_hole=[0.2,0.35,0.5,0.65,0.8]" \
+  --set "eval.mask_prob_grid=[0.4,0.5,0.6]" \
+  --set "eval.mask_nms_iou_label_grid=[0.3,0.4,0.5,0.6]" \
+  --set "eval.mask_nms_iou_hole_grid=[0.25,0.35,0.45,0.55]"

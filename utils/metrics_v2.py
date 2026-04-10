@@ -326,21 +326,24 @@ def search_thresholds(
     coco_selector=None,
     score_grid_label: Sequence[float],
     score_grid_hole: Sequence[float],
+    mask_prob_grid: Sequence[float],
     nms_grid_label: Sequence[float],
     nms_grid_hole: Sequence[float],
 ) -> dict[str, Any]:
     search_results = []
     best_summary = None
 
-    for score_thresh_label, score_thresh_hole, mask_nms_iou_label, mask_nms_iou_hole in itertools.product(
+    for score_thresh_label, score_thresh_hole, mask_prob_thresh, mask_nms_iou_label, mask_nms_iou_hole in itertools.product(
         score_grid_label,
         score_grid_hole,
+        mask_prob_grid,
         nms_grid_label,
         nms_grid_hole,
     ):
         thresholds = {
             "score_thresh_label": float(score_thresh_label),
             "score_thresh_hole": float(score_thresh_hole),
+            "mask_prob_thresh": float(mask_prob_thresh),
             "mask_nms_iou_label": float(mask_nms_iou_label),
             "mask_nms_iou_hole": float(mask_nms_iou_hole),
         }
@@ -378,6 +381,7 @@ def search_thresholds(
         "best_thresholds": {
             "score_thresh_label": best_summary[1]["score_thresh_label"],
             "score_thresh_hole": best_summary[1]["score_thresh_hole"],
+            "mask_prob_thresh": best_summary[1]["mask_prob_thresh"],
             "mask_nms_iou_label": best_summary[1]["mask_nms_iou_label"],
             "mask_nms_iou_hole": best_summary[1]["mask_nms_iou_hole"],
         },

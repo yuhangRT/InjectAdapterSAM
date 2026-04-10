@@ -190,3 +190,41 @@ def test_trainer_to_device_preserves_processed_size_for_matcher() -> None:
     moved = trainer._to_device(batch["instances"], torch.device("cpu"), processed_sizes=batch["processed_size"])
 
     assert moved[0]["processed_size"] == (64, 64)
+
+
+def test_load_checkpoint_ignores_legacy_score_fusion_mlp_weights(tmp_path: Path) -> None:
+    model = _build_test_model()
+    checkpoint_path = tmp_path / "legacy_score_fusion.pth"
+    state = {
+        "model": {
+            **model.state_dict(),
+            "score_fusion.mlp.0.weight": torch.randn(8, 4),
+            "score_fusion.mlp.0.bias": torch.randn(8),
+            "score_fusion.mlp.2.weight": torch.randn(1, 8),
+            "score_fusion.mlp.2.bias": torch.randn(1),
+        }
+    }
+    torch.save(state, checkpoint_path)
+
+    reloaded_model = _build_test_model()
+    loaded = load_checkpoint(checkpoint_path, model=reloaded_model)
+
+    assert "model" in loaded
+
+
+def test_load_checkpoint_ignores_missing_score_fusion_weights_from_parameter_free_version(tmp_path: Path) -> None:
+    model = _build_test_model()
+    checkpoint_path = tmp_path / "parameter_free_score_fusion.pth"
+    state = {
+        "model": {
+            key: value
+            for key, value in model.state_dict().items()
+            if not key.startswith("score_fusion.")
+        }
+    }
+    torch.save(state, checkpoint_path)
+
+    reloaded_model = _build_test_model()
+    loaded = load_checkpoint(checkpoint_path, model=reloaded_model)
+
+    assert "model" in loaded

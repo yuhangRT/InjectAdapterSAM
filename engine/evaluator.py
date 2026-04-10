@@ -23,6 +23,7 @@ class WireCRHQInstSAMEvaluator:
         device: str | torch.device = "cpu",
         score_grid_label: Sequence[float] = (0.2, 0.35, 0.5, 0.65),
         score_grid_hole: Sequence[float] = (0.2, 0.35, 0.5, 0.65),
+        mask_prob_grid: Sequence[float] = (0.4, 0.5, 0.6),
         nms_grid_label: Sequence[float] = (0.5, 0.6, 0.7),
         nms_grid_hole: Sequence[float] = (0.45, 0.55, 0.65),
     ) -> None:
@@ -30,6 +31,7 @@ class WireCRHQInstSAMEvaluator:
         self.device = torch.device(device)
         self.score_grid_label = tuple(float(value) for value in score_grid_label)
         self.score_grid_hole = tuple(float(value) for value in score_grid_hole)
+        self.mask_prob_grid = tuple(float(value) for value in mask_prob_grid)
         self.nms_grid_label = tuple(float(value) for value in nms_grid_label)
         self.nms_grid_hole = tuple(float(value) for value in nms_grid_hole)
 
@@ -192,7 +194,9 @@ class WireCRHQInstSAMEvaluator:
                 )
             else:
                 raise ValueError(f"Unsupported output_space: {output_space}")
-            binary_mask = mask_logits > 0.0
+            binary_mask = mask_logits.sigmoid() > float(thresholds.get("mask_prob_thresh", 0.5))
+            if int(binary_mask.sum().item()) <= 0:
+                continue
             box = cls._box_from_mask(binary_mask)
             candidates.append(
                 {
@@ -234,6 +238,7 @@ class WireCRHQInstSAMEvaluator:
             coco_selector=self._select_coco_instances_from_record,
             score_grid_label=self.score_grid_label,
             score_grid_hole=self.score_grid_hole,
+            mask_prob_grid=self.mask_prob_grid,
             nms_grid_label=self.nms_grid_label,
             nms_grid_hole=self.nms_grid_hole,
         )
@@ -248,6 +253,7 @@ class WireCRHQInstSAMEvaluator:
                 coco_selector=self._select_coco_instances_from_record,
                 score_grid_label=self.score_grid_label,
                 score_grid_hole=self.score_grid_hole,
+                mask_prob_grid=self.mask_prob_grid,
                 nms_grid_label=self.nms_grid_label,
                 nms_grid_hole=self.nms_grid_hole,
             )

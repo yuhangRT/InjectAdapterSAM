@@ -79,6 +79,7 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
         score_grid_label=tuple(eval_cfg.get("score_grid_label", (0.2, 0.35, 0.5, 0.65))),
         score_grid_hole=tuple(eval_cfg.get("score_grid_hole", (0.2, 0.35, 0.5, 0.65))),
+        mask_prob_grid=tuple(eval_cfg.get("mask_prob_grid", (0.4, 0.5, 0.6))),
         nms_grid_label=tuple(eval_cfg.get("mask_nms_iou_label_grid", (0.5, 0.6, 0.7))),
         nms_grid_hole=tuple(eval_cfg.get("mask_nms_iou_hole_grid", (0.45, 0.55, 0.65))),
     )

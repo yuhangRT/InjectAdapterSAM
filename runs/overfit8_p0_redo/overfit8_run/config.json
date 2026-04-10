@@ -1,0 +1,87 @@
+{
+  "runtime": {
+    "output_dir": "./runs/overfit8_p0_redo/overfit8_run",
+    "seed": 42,
+    "gpu": 0,
+    "resume": null
+  },
+  "data": {
+    "root": "./runs/overfit8_p0_redo/overfit8_data",
+    "train_split": "train",
+    "val_split": "val",
+    "image_size": 1024,
+    "full_image_prob": 0.5,
+    "object_crop_prob": 0.5,
+    "hole_focused_prob": 0.6,
+    "label_focused_prob": 0.4
+  },
+  "model": {
+    "name": "WireCRHQInstSAM",
+    "sam_model_type": "vit_b",
+    "checkpoint": "./checkpoints/sam_vit_b_01ec64.pth",
+    "num_queries": 64,
+    "query_decoder_layers": 6,
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "lora_dropout": 0.0
+  },
+  "train": {
+    "epochs": 90,
+    "warmup_epochs": 8,
+    "batch_size": 1,
+    "val_batch_size": 1,
+    "workers": 4,
+    "lr_lora": "1e-5",
+    "lr_new_modules": "5e-5",
+    "weight_decay": 0.05,
+    "warmup_iters": 32,
+    "grad_accum_steps": 1,
+    "grad_clip_norm": 0.05,
+    "amp": false,
+    "val_workers": 2,
+    "pin_memory": true,
+    "persistent_workers": true,
+    "prefetch_factor": 2,
+    "val_interval": 10
+  },
+  "infer": {
+    "sliding_window": 1024,
+    "overlap": 0.2,
+    "score_thresh_label": "auto_from_val",
+    "score_thresh_hole": "auto_from_val",
+    "mask_prob_thresh": 0.5
+  },
+  "eval": {
+    "mask_prob_grid": [
+      0.4,
+      0.5,
+      0.6
+    ],
+    "score_grid_label": [
+      0.2,
+      0.35,
+      0.5,
+      0.65,
+      0.8
+    ],
+    "score_grid_hole": [
+      0.2,
+      0.35,
+      0.5,
+      0.65,
+      0.8
+    ],
+    "mask_nms_iou_label_grid": [
+      0.3,
+      0.4,
+      0.5,
+      0.6
+    ],
+    "mask_nms_iou_hole_grid": [
+      0.25,
+      0.35,
+      0.45,
+      0.55
+    ]
+  }
+}

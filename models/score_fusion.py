@@ -14,7 +14,7 @@ class ScoreFusion(nn.Module):
     def __init__(self, hidden_dim: int = 16) -> None:
         super().__init__()
         self.mlp = nn.Sequential(
-            nn.Linear(4, hidden_dim),
+            nn.Linear(5, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -26,6 +26,7 @@ class ScoreFusion(nn.Module):
         box_quality: torch.Tensor,
         coarse_mask_score: torch.Tensor,
         refine_quality_score: torch.Tensor,
+        coarse_score_missing: torch.Tensor,
     ) -> torch.Tensor:
         features = torch.stack(
             (
@@ -33,6 +34,7 @@ class ScoreFusion(nn.Module):
                 box_quality.float(),
                 coarse_mask_score.float(),
                 refine_quality_score.float(),
+                coarse_score_missing.float(),
             ),
             dim=-1,
         )

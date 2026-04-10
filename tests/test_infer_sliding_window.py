@@ -87,3 +87,32 @@ def test_sliding_window_cross_window_fusion_and_exports(tmp_path: Path) -> None:
     assert (tmp_path / "vis" / "sample.png").is_file()
     assert (tmp_path / "masks" / "sample_inst_000.png").is_file()
     assert (tmp_path / "rectified_crops" / "sample_inst_000.png").is_file()
+
+
+def test_window_instances_respect_mask_probability_threshold() -> None:
+    inferencer = WireCRHQInstSAMInferencer(
+        model=_FakeWindowModel(),
+        device="cpu",
+        sliding_window=64,
+        overlap=0.5,
+        score_thresh_label=0.1,
+        score_thresh_hole=0.1,
+        mask_prob_thresh=0.7,
+        mask_nms_iou_label=0.6,
+        mask_nms_iou_hole=0.5,
+    )
+
+    fused_batch = {
+        "labels": torch.tensor([1], dtype=torch.long),
+        "instance_scores": torch.tensor([0.95], dtype=torch.float32),
+        "refined_mask_logits": torch.full((1, 1, 16, 16), 0.2, dtype=torch.float32),
+        "boxes_xyxy": torch.tensor([[8.0, 8.0, 24.0, 24.0]], dtype=torch.float32),
+    }
+    instances = inferencer._fused_batch_to_window_instances(
+        fused_batch,
+        crop_size=(32, 32),
+        window_box=(0, 0, 32, 32),
+        full_size=(32, 32),
+    )
+
+    assert instances == []

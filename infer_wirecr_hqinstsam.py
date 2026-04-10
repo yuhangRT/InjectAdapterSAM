@@ -29,6 +29,7 @@ def _load_thresholds(checkpoint_path: str | Path, infer_cfg: dict[str, object]) 
     thresholds = dict(state.get("best_val_thresholds", {}))
     thresholds.setdefault("score_thresh_label", infer_cfg.get("score_thresh_label", 0.5))
     thresholds.setdefault("score_thresh_hole", infer_cfg.get("score_thresh_hole", 0.5))
+    thresholds.setdefault("mask_prob_thresh", infer_cfg.get("mask_prob_thresh", 0.5))
     thresholds.setdefault("mask_nms_iou_label", infer_cfg.get("mask_nms_iou_label", 0.6))
     thresholds.setdefault("mask_nms_iou_hole", infer_cfg.get("mask_nms_iou_hole", 0.5))
     for key, value in list(thresholds.items()):
@@ -66,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         overlap=float(infer_cfg.get("overlap", 0.2)),
         score_thresh_label=thresholds["score_thresh_label"],
         score_thresh_hole=thresholds["score_thresh_hole"],
+        mask_prob_thresh=thresholds["mask_prob_thresh"],
         mask_nms_iou_label=thresholds["mask_nms_iou_label"],
         mask_nms_iou_hole=thresholds["mask_nms_iou_hole"],
     )

@@ -28,6 +28,7 @@ class WireCRHQInstSAMInferencer:
         overlap: float = 0.2,
         score_thresh_label: float = 0.5,
         score_thresh_hole: float = 0.5,
+        mask_prob_thresh: float = 0.5,
         mask_nms_iou_label: float = 0.6,
         mask_nms_iou_hole: float = 0.5,
     ) -> None:
@@ -37,6 +38,7 @@ class WireCRHQInstSAMInferencer:
         self.overlap = float(overlap)
         self.score_thresh_label = float(score_thresh_label)
         self.score_thresh_hole = float(score_thresh_hole)
+        self.mask_prob_thresh = float(mask_prob_thresh)
         self.mask_nms_iou_label = float(mask_nms_iou_label)
         self.mask_nms_iou_hole = float(mask_nms_iou_hole)
 
@@ -99,7 +101,9 @@ class WireCRHQInstSAMInferencer:
             score_threshold = self.score_thresh_label if label == 1 else self.score_thresh_hole
             if score < score_threshold:
                 continue
-            local_mask = upsampled_logits[index] > 0.0
+            local_mask = upsampled_logits[index].sigmoid() > self.mask_prob_thresh
+            if int(local_mask.sum().item()) <= 0:
+                continue
             full_mask = torch.zeros((full_height, full_width), dtype=torch.bool)
             full_mask[y1 : y1 + crop_height, x1 : x1 + crop_width] = local_mask
             local_box = fused_batch["boxes_xyxy"][index].detach().cpu().float()

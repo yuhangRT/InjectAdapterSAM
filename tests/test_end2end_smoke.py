@@ -61,17 +61,60 @@ def _gt_instances() -> dict[str, torch.Tensor | tuple[int, int]]:
     }
 
 
+def _configure_test_score_fusion(fusion: ScoreFusion) -> None:
+    with torch.no_grad():
+        fusion.mlp[0].weight.zero_()
+        fusion.mlp[0].bias.zero_()
+        fusion.mlp[0].weight[0] = torch.tensor([1.5, 0.5, 0.5, 1.0, -1.0], dtype=torch.float32)
+        fusion.mlp[2].weight.zero_()
+        fusion.mlp[2].bias.zero_()
+        fusion.mlp[2].weight[0, 0] = 1.0
+
+
 def test_score_fusion_and_classwise_mask_nms_behave_as_explicit_modules() -> None:
     fusion = ScoreFusion(hidden_dim=8)
+    _configure_test_score_fusion(fusion)
     fused = fusion(
         class_score=torch.tensor([0.8, 0.6], dtype=torch.float32),
         box_quality=torch.tensor([0.9, 0.7], dtype=torch.float32),
         coarse_mask_score=torch.tensor([0.7, 0.5], dtype=torch.float32),
         refine_quality_score=torch.tensor([0.85, 0.4], dtype=torch.float32),
+        coarse_score_missing=torch.tensor([0.0, 0.0], dtype=torch.float32),
     )
-    naive = torch.tensor([0.8 * 0.9 * 0.7 * 0.85, 0.6 * 0.7 * 0.5 * 0.4], dtype=torch.float32)
     assert torch.isfinite(fused).all()
-    assert not torch.allclose(fused, naive)
+    assert float(fused[0].item()) > float(fused[1].item())
+
+    stronger = fusion(
+        class_score=torch.tensor([0.9], dtype=torch.float32),
+        box_quality=torch.tensor([0.9], dtype=torch.float32),
+        coarse_mask_score=torch.tensor([0.7], dtype=torch.float32),
+        refine_quality_score=torch.tensor([0.85], dtype=torch.float32),
+        coarse_score_missing=torch.tensor([0.0], dtype=torch.float32),
+    )
+    weaker = fusion(
+        class_score=torch.tensor([0.5], dtype=torch.float32),
+        box_quality=torch.tensor([0.9], dtype=torch.float32),
+        coarse_mask_score=torch.tensor([0.7], dtype=torch.float32),
+        refine_quality_score=torch.tensor([0.85], dtype=torch.float32),
+        coarse_score_missing=torch.tensor([0.0], dtype=torch.float32),
+    )
+    assert float(stronger.item()) > float(weaker.item())
+
+    available = fusion(
+        class_score=torch.tensor([0.8], dtype=torch.float32),
+        box_quality=torch.tensor([0.9], dtype=torch.float32),
+        coarse_mask_score=torch.tensor([0.7], dtype=torch.float32),
+        refine_quality_score=torch.tensor([0.85], dtype=torch.float32),
+        coarse_score_missing=torch.tensor([0.0], dtype=torch.float32),
+    )
+    missing = fusion(
+        class_score=torch.tensor([0.8], dtype=torch.float32),
+        box_quality=torch.tensor([0.9], dtype=torch.float32),
+        coarse_mask_score=torch.tensor([0.7], dtype=torch.float32),
+        refine_quality_score=torch.tensor([0.85], dtype=torch.float32),
+        coarse_score_missing=torch.tensor([1.0], dtype=torch.float32),
+    )
+    assert float(available.item()) > float(missing.item())
 
     masks = torch.zeros((3, 8, 8), dtype=torch.bool)
     masks[0, 1:5, 1:5] = True
@@ -112,5 +155,38 @@ def test_closed_loop_forward_returns_stable_training_eval_and_inference_dicts() 
 
     fused_batch = outputs["eval_dict"]["fused_batches"][0]
     assert "instance_scores" in fused_batch
+    assert "coarse_score_missing" in fused_batch
     assert torch.isfinite(fused_batch["instance_scores"]).all()
     assert outputs["inference_dict"]["instances"]
+
+
+def test_postprocess_instances_respects_mask_prob_threshold() -> None:
+    model = _build_test_model(num_queries=1)
+    fused_outputs = {
+        "fused_batches": [
+            {
+                "labels": torch.tensor([1], dtype=torch.long),
+                "instance_scores": torch.tensor([0.9], dtype=torch.float32),
+                "refined_mask_logits": torch.full((1, 1, 16, 16), 0.2, dtype=torch.float32),
+                "boxes_xyxy": torch.tensor([[2.0, 2.0, 14.0, 14.0]], dtype=torch.float32),
+                "quality_scores": torch.tensor([0.8], dtype=torch.float32),
+                "class_scores": torch.tensor([0.8], dtype=torch.float32),
+                "prompt_meta": [{"instance_source": "pred"}],
+                "coarse_score_missing": torch.tensor([False]),
+            }
+        ]
+    }
+
+    kept = model.postprocess_instances(
+        fused_outputs,
+        score_threshold=0.1,
+        mask_prob_thresh=0.5,
+    )["instances"][0]
+    suppressed = model.postprocess_instances(
+        fused_outputs,
+        score_threshold=0.1,
+        mask_prob_thresh=0.7,
+    )["instances"][0]
+
+    assert len(kept) == 1
+    assert suppressed == []

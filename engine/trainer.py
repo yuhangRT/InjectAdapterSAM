@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import contextlib
 import json
 import math
 from dataclasses import dataclass
@@ -12,6 +13,11 @@ from typing import Any, Iterable, Mapping, Sequence
 import torch
 import torch.nn.functional as F
 from torch import amp as torch_amp
+
+try:
+    from torch.cuda import amp as cuda_amp
+except ImportError:  # pragma: no cover
+    cuda_amp = None
 
 from utils.checkpoint import DEFAULT_CHECKPOINT_FILENAMES, build_checkpoint_state, load_checkpoint, save_checkpoint
 from utils.losses_coarse import CoarseLossCriterion
@@ -118,6 +124,26 @@ class _ProxyMetricAccumulator:
         }
 
 
+class _NullGradScaler:
+    def scale(self, loss: torch.Tensor) -> torch.Tensor:
+        return loss
+
+    def unscale_(self, optimizer: torch.optim.Optimizer) -> None:
+        return None
+
+    def step(self, optimizer: torch.optim.Optimizer) -> None:
+        optimizer.step()
+
+    def update(self) -> None:
+        return None
+
+    def state_dict(self) -> dict[str, Any]:
+        return {}
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        return None
+
+
 class WireCRHQInstSAMTrainer:
     """Single-trainer implementation with warmup/joint curriculum and checkpointing."""
 
@@ -180,7 +206,7 @@ class WireCRHQInstSAMTrainer:
 
         self.optimizer = optimizer or self.build_optimizer()
         self.scheduler = scheduler or self.build_scheduler()
-        self.scaler = scaler or torch_amp.GradScaler("cuda", enabled=self.amp_enabled)
+        self.scaler = scaler or self.build_grad_scaler()
         self.evaluator = evaluator
         self.state = TrainerState()
         self.history: list[dict[str, Any]] = []
@@ -233,6 +259,24 @@ class WireCRHQInstSAMTrainer:
             return 0.5 * (1.0 + math.cos(math.pi * progress))
 
         return torch.optim.lr_scheduler.LambdaLR(self.optimizer, _schedule)
+
+    def build_grad_scaler(self) -> Any:
+        if not self.amp_enabled:
+            return _NullGradScaler()
+        if hasattr(torch_amp, "GradScaler"):
+            return torch_amp.GradScaler("cuda", enabled=True)
+        if cuda_amp is not None and hasattr(cuda_amp, "GradScaler"):
+            return cuda_amp.GradScaler(enabled=True)
+        return _NullGradScaler()
+
+    def autocast(self):
+        if not self.amp_enabled:
+            return contextlib.nullcontext()
+        if hasattr(torch_amp, "autocast"):
+            return torch_amp.autocast(device_type=self.device.type, enabled=True)
+        if cuda_amp is not None and hasattr(cuda_amp, "autocast"):
+            return cuda_amp.autocast(enabled=True)
+        return contextlib.nullcontext()
 
     def resolve_curriculum(self, epoch: int) -> CurriculumState:
         if epoch < self.warmup_epochs:
@@ -371,6 +415,7 @@ class WireCRHQInstSAMTrainer:
     def _default_thresholds(self) -> dict[str, Any]:
         score_thresh_label = self.infer_config.get("score_thresh_label", 0.5)
         score_thresh_hole = self.infer_config.get("score_thresh_hole", 0.5)
+        mask_prob_thresh = self.infer_config.get("mask_prob_thresh", 0.5)
         def _coerce_threshold(value: Any) -> float:
             if isinstance(value, str) and value == "auto_from_val":
                 return 0.5
@@ -379,6 +424,7 @@ class WireCRHQInstSAMTrainer:
         return {
             "score_thresh_label": _coerce_threshold(score_thresh_label),
             "score_thresh_hole": _coerce_threshold(score_thresh_hole),
+            "mask_prob_thresh": _coerce_threshold(mask_prob_thresh),
             "mask_nms_iou_label": float(getattr(self.model.mask_nms, "iou_threshold", 0.6)),
             "mask_nms_iou_hole": float(getattr(self.model.mask_nms, "iou_threshold", 0.6)),
         }
@@ -487,7 +533,7 @@ class WireCRHQInstSAMTrainer:
                 self.device,
                 processed_sizes=batch.get("processed_size"),
             )
-            with torch_amp.autocast(device_type=self.device.type, enabled=self.amp_enabled):
+            with self.autocast():
                 outputs = self.model(
                     images,
                     targets=targets,

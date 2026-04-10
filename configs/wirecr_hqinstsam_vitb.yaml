@@ -13,6 +13,7 @@ data:
 model:
   name: WireCRHQInstSAM
   sam_model_type: vit_b
+  checkpoint: ./checkpoints/sam_vit_b_01ec64.pth
   num_queries: 64
   query_decoder_layers: 6
   lora_rank: 8
@@ -38,3 +39,7 @@ infer:
   overlap: 0.2
   score_thresh_label: auto_from_val
   score_thresh_hole: auto_from_val
+  mask_prob_thresh: 0.5
+
+eval:
+  mask_prob_grid: [0.4, 0.5, 0.6]

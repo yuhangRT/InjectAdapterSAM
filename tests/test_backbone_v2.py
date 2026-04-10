@@ -193,6 +193,7 @@ def test_yaml_model_config_alias_maps_to_model_type_and_drives_model_build() -> 
         encoder_depth=12,
         encoder_num_heads=4,
         encoder_global_attn_indexes=(2, 5, 8, 11),
+        checkpoint=None,
     )
     report = model.get_trainable_parameter_report()
     assert report["lora"]["parameter_count"] > 0
